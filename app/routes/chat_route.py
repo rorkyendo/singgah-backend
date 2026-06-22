@@ -10,8 +10,8 @@ import json
 router = APIRouter(prefix="/message")
 
 @router.post("/send")
-def send_message_route(data: ChatHistory, db: Session = Depends(get_db)):
-    return send_message(db, data)
+async def send_message_route(data: ChatHistory, db: Session = Depends(get_db)):
+    return await send_message(db, data)
 
 @router.delete("/delete/{message_id}")
 def delete_message_route(message_id: int, db: Session = Depends(get_db)):
@@ -41,17 +41,7 @@ async def websocket_send_message(websocket: WebSocket):
             data_dict = json.loads(data)
             chat_data = ChatHistory(**data_dict)
             with next(get_db()) as db:
-                message = send_message(db, chat_data)
-            await websocket.send_json({
-                "status": "success",
-                "message": {
-                    "chat_id": message.chat_id,
-                    "session": message.session,
-                    "message": message.message,
-                    "replied": message.replied,
-                    "read": message.read,
-                    "chattime": str(message.chattime)
-                }
-            })
+                response = await send_message(db, chat_data)
+            await websocket.send_json(response)
     except WebSocketDisconnect:
         pass
