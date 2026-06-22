@@ -4,6 +4,17 @@ from app.models.user import User
 from app.schemas.user import UserCreate
 
 def create_user(db: Session, data: UserCreate):
+    existing_user = db.query(User).filter(User.phone == data.phone).first()
+    if existing_user:
+        existing_user.name = data.name
+        existing_user.status_pernikahan = data.status_pernikahan
+        existing_user.budget_min = data.budget_min
+        existing_user.budget_max = data.budget_max
+        existing_user.lokasi = data.lokasi
+        db.commit()
+        db.refresh(existing_user)
+        return {"session": existing_user.session}
+
     session_id = str(uuid.uuid4())
     user = User(
         session=session_id,
