@@ -209,25 +209,51 @@ class HousingAgent:
             url=url,
         )
 
-    def _generate_llm_products(self, user_message: str, user_info: dict, language: str = "id") -> list[dict]:
-        from app.controllers.orchestrator_controller import recommendationMessages
+    def _generate_text_recommendation(
+        self,
+        user_message: str,
+        user_info: dict,
+        language: str = "id",
+    ) -> str:
+        lang = (language or "id").lower()
+        prompt = (
+            "Berikan 3 rekomendasi tempat tinggal (kost/kontrakan) yang cocok "
+            f"berdasarkan data user: {json.dumps(user_info, ensure_ascii=False)}. "
+            "Jawab dalam 2 paragraf: paragraf pertama ringkasan kebutuhan user, "
+            "paragraf kedua rekomendasi tempat beserta alasannya. "
+            "Jangan berikan format daftar/point. "
+            "Gunakan bahasa Indonesia santai."
+        ) if lang == "id" else (
+            "Provide 3 accommodation recommendations (boarding house/rented house) that match "
+            f"the user data: {json.dumps(user_info, ensure_ascii=False)}. "
+            "Answer in 2 paragraphs: first paragraph summarizes user needs, "
+            "second paragraph gives recommendations with reasons. "
+            "Do not use bullet points. Keep it casual and friendly."
+        )
 
-        details = {
-            'message': user_message,
-            'user_information': user_info,
-        }
-        llm_response = recommendationMessages(json.dumps(details), language)
-        tempat_list = [t.strip() for t in llm_response.split(",") if t.strip()]
+        messages = [
+            {"role": "system", "content": self._get_prompt(lang, "SYSTEM_PROMPT")},
+            {"role": "system", "content": self._get_prompt(lang, "FILTER_PROMPT")},
+            {"role": "user", "content": prompt},
+        ]
 
-        products = []
-        for tempat_name in tempat_list:
-            products.append({
-                "nama_tempat": tempat_name,
-                "tipe": "Kost" if "kost" in tempat_name.lower() else "Kontrakan",
-                "harga": "Sesuai budget",
-                "lokasi": user_info.get("lokasi", ""),
-            })
-        return products
+        try:
+            stream = llm_client.chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=messages,
+                temperature=0.5,
+                max_tokens=500,
+                top_p=0.7,
+                stream=True,
+            )
+            return "".join(
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if chunk.choices[0].delta.content
+            )
+        except Exception as e:
+            logger.error("LLM text recommendation failed: %s", e)
+            return self._fallback_text(json.dumps({"tempat_rekomendasi": [], "user_information": user_info}), language)
 
     async def run(
         self,
@@ -254,18 +280,18 @@ class HousingAgent:
         if ranked:
             details_json = self.format_for_llm(ranked, user_info)
             products = self.listings_to_products(ranked)
-        else:
-            products = self._generate_llm_products(user_message, user_info, language)
-            details_json = json.dumps({
-                "tempat_rekomendasi": [{"nama": p["nama_tempat"], "tipe": p["tipe"]} for p in products],
-                "user_information": user_info,
-            })
+            check_result = self.generate_recommendation_text(details_json, language)
+            return {
+                "rc": "200",
+                "messages": [line for line in check_result.splitlines() if line.strip()],
+                "is_product": True,
+                "product": products,
+            }
 
-        check_result = self.generate_recommendation_text(details_json, language)
-
+        text_response = self._generate_text_recommendation(user_message, user_info, language)
         return {
             "rc": "200",
-            "messages": [line for line in check_result.splitlines() if line.strip()],
-            "is_product": True,
-            "product": products,
+            "messages": [line for line in text_response.splitlines() if line.strip()],
+            "is_product": False,
+            "product": [],
         }
