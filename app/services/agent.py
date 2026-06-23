@@ -1,12 +1,17 @@
+import asyncio
 import json
 import logging
-from dataclasses import asdict
-from typing import Optional
 
+import httpx
 from openai import OpenAI
 
 from app.core.config import settings
-from app.services.scraper import PropertyListing, run_all_scrapers
+from app.services.base import PropertyListing
+from app.services.olx_service import OLXAgent
+from app.services.mamikost_service import MamikostAgent
+from app.services.pinhome_service import PinhomeAgent
+from app.services.lamudi_service import LamudiAgent
+from app.services.facebook_service import FacebookAgent
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +24,13 @@ llm_client = OpenAI(
 class HousingAgent:
     def __init__(self):
         self.scraped_listings: list[PropertyListing] = []
+        self.service_agents = [
+            OLXAgent(),
+            MamikostAgent(),
+            PinhomeAgent(),
+            LamudiAgent(),
+            FacebookAgent(),
+        ]
 
     async def search_listings(
         self,
@@ -30,13 +42,19 @@ class HousingAgent:
     ) -> list[PropertyListing]:
         property_type = "kontrakan" if status_pernikahan == "menikah" else "kost"
 
-        self.scraped_listings = await run_all_scrapers(
-            location=location,
-            budget_min=budget_min,
-            budget_max=budget_max,
-            property_type=property_type,
-            limit_per_source=limit_per_source,
-        )
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                agent.search_and_analyze(
+                    client, location, budget_min, budget_max, property_type, limit_per_source,
+                )
+                for agent in self.service_agents
+            ]
+            results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.scraped_listings = []
+        for result in results_per_source:
+            if isinstance(result, list):
+                self.scraped_listings.extend(result)
 
         logger.info(
             "Scraped %d listings from %d sources for %s in %s",
