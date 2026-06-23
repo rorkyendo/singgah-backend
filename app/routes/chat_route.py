@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 from app.schemas.chat import ChatHistory
 from app.controllers.inbound_controller import (
     send_message, delete_message, update_message, get_chat_history_by_session,
-    get_property_detail
+    get_property_detail, save_property, get_saved_properties
 )
+from app.schemas.property import SavePropertyRequest
 from app.db.session import get_db
 import json
 
@@ -36,6 +37,16 @@ def get_history_route(session_id: str, db: Session = Depends(get_db)):
 @router.post("/property-detail")
 async def property_detail_route(data: dict):
     return await get_property_detail(data.get("url", ""), data.get("source", ""))
+
+@router.post("/save-property")
+async def save_property_route(data: SavePropertyRequest, db: Session = Depends(get_db)):
+    return await save_property(db, data)
+
+
+@router.get("/saved/{session_id}")
+def get_saved_route(session_id: str, db: Session = Depends(get_db)):
+    return get_saved_properties(db, session_id)
+
 
 @router.websocket("/ws/send")
 async def websocket_send_message(websocket: WebSocket):

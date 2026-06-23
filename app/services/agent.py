@@ -1,17 +1,18 @@
 import asyncio
 import json
 import logging
+import re
 
 import httpx
 from openai import OpenAI
 
-from app.core.config import settings
+from app.core.config import settings, prompts
 from app.services.base import PropertyListing, PropertyDetail
-from app.services.rumah123_service import Rumah123Agent
-from app.services.mamikost_service import MamikostAgent
-from app.services.pinhome_service import PinhomeAgent
-from app.services.lamudi_service import LamudiAgent
-from app.services.facebook_service import FacebookAgent
+from app.agents.rumah123_agent import Rumah123Agent
+from app.agents.mamikost_agent import MamikostAgent
+from app.agents.pinhome_agent import PinhomeAgent
+from app.agents.lamudi_agent import LamudiAgent
+from app.agents.ninetynineco_agent import NinetyNineCoAgent
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +22,39 @@ llm_client = OpenAI(
 )
 
 
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F680-\U0001F6FF"  # transport & map symbols
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U0001FA70-\U0001FAFF"
+    "\u2600-\u26FF"          # miscellaneous symbols
+    "\u2700-\u27BF"          # dingbats
+    "\u2300-\u23FF"          # miscellaneous technical
+    "\u2B50-\u2B55"          # stars, etc.
+    "\uFE00-\uFE0F"          # variation selectors
+    "\U0001F3FB-\U0001F3FF" # skin tone modifiers
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def sanitize_text(text: str | None) -> str:
+    """Strip emojis and other decorative Unicode characters, then clean whitespace."""
+    if not text:
+        return ""
+    text = _EMOJI_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 class HousingAgent:
     # Sources that are expected to provide real URLs and images
-    RELIABLE_SOURCES = {"Rumah123", "Mamikost", "Pinhome", "Lamudi"}
+    RELIABLE_SOURCES = {"Rumah123", "Mamikost", "Pinhome", "Lamudi", "99.co"}
 
     def __init__(self):
         self.scraped_listings: list[PropertyListing] = []
@@ -32,8 +63,21 @@ class HousingAgent:
             MamikostAgent(),
             PinhomeAgent(),
             LamudiAgent(),
-            FacebookAgent(),
+            NinetyNineCoAgent(),
         ]
+
+    # URL/title patterns that indicate articles, guides, and other non-listings
+    _JUNK_URL_SEGMENTS = (
+        "/journal/", "/jurnal/", "/kpr/", "/panduan/", "/pedoman/", "/blog/",
+        "/artikel/", "/tips/", "/bantuan/", "/tentang/", "/kebijakan/", "/syarat/",
+        "/career/", "/karir/", "/hubungi/", "/partner/", "/faq/", "/disclaimer/",
+    )
+    _JUNK_TITLE_KEYWORDS = (
+        "simulasi", "kpr", "panduan", "pedoman", "jurnal", "journal", "blog",
+        "artikel", "berita", "tips", "cara", "syarat", "tutorial", "kuis",
+        "faq", "bantuan", "tentang", "kebijakan", "ketentuan", "disclaimer",
+        "partner", "karir", "career", "hubungi", "dijual",
+    )
 
     def _is_valid_listing(
         self,
@@ -45,17 +89,24 @@ class HousingAgent:
     ) -> bool:
         """Filter out junk/non-property listings and enforce budget/tenure/type."""
         title = (listing.title or "").lower().strip()
+        url = (listing.url or "").lower().strip()
         if not title or len(title) < 5:
+            return False
+
+        # Reject non-listing pages (guides, articles, KPR, etc.)
+        if any(k in title for k in self._JUNK_TITLE_KEYWORDS):
+            return False
+        if any(k in url for k in self._JUNK_URL_SEGMENTS):
             return False
 
         if property_type == "kontrakan":
             # Kontrakan searches should not return kost/kosan/boarding rooms
-            if any(k in title for k in ["kost", "kosan", "kost-kostan", "kost putri", "kost cowok"]):
+            if any(k in title for k in ["kost", "kos", "kosan", "kost-kostan", "kost putri", "kost cowok", "kos putri", "kos cowok"]):
                 return False
 
         # Property-related keywords any valid title should contain
         property_keywords = [
-            "kost", "kos", "kontrakan", "kontrakan", "rumah", "apartemen",
+            "kost", "kos", "kontrakan", "rumah", "apartemen",
             "apartment", "sewa", "kamar", "disewakan", "cluster",
             "perumahan", "ruko", "villa", "mewah", "asri", "nyaman", "strategis",
         ]
@@ -105,28 +156,13 @@ class HousingAgent:
         language: str = "id",
     ) -> list[str]:
         """Use LLM to expand broad regions (e.g., Jabodetabek) into specific cities."""
-        prompt = (
-            f"User sedang mencari {property_type} di wilayah '{location}'. "
-            "Jika lokasi tersebut adalah wilayah luas/metropolitan (misal Jabodetabek, Jabotabek, Greater Jakarta), "
-            "kembalikan daftar kota/kabupaten spesifik yang termasuk dalam wilayah tersebut sebagai JSON array string. "
-            f"Jika sudah spesifik, kembalikan [\"{location}\"]. "
-            "Contoh: Jabodetabek -> [\"Jakarta\", \"Bogor\", \"Depok\", \"Tangerang\", \"Bekasi\"]. "
-            "Kembalikan hanya JSON array string, tanpa penjelasan."
-        )
-        if language.lower() == "en":
-            prompt = (
-                f"User is searching for {property_type} in area '{location}'. "
-                "If the location is a broad metropolitan region (e.g., Jabodetabek, Greater Jakarta), "
-                "return a JSON array of specific cities/districts within that region. "
-                f"If already specific, return [\"{location}\"]. "
-                "Example: Jabodetabek -> [\"Jakarta\", \"Bogor\", \"Depok\", \"Tangerang\", \"Bekasi\"]. "
-                "Return only a JSON array of strings, no explanation."
-            )
+        prompt = prompts.format(language, "expand_location",
+                                property_type=property_type, location=location)
         try:
             response = llm_client.chat.completions.create(
                 model=settings.LLM_MODEL,
                 messages=[
-                    {"role": "system", "content": settings.SYSTEM_PROMPT},
+                    {"role": "system", "content": prompts.get(language, "system")},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0,
@@ -137,7 +173,13 @@ class HousingAgent:
             text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             locations = json.loads(text)
             if isinstance(locations, list) and locations:
-                return [str(loc).strip() for loc in locations if loc]
+                locations = [str(loc).strip() for loc in locations if loc]
+                # If the LLM returned a broader location (e.g. "Jakarta Pusat" -> "Jakarta"),
+                # keep the original specific location as a safety net.
+                original_lower = location.lower().strip()
+                if not any(original_lower in loc.lower() or loc.lower() in original_lower for loc in locations):
+                    locations.insert(0, location)
+                return locations
         except Exception as e:
             logger.warning("_expand_location failed: %s", e)
         return [location]
@@ -152,19 +194,19 @@ class HousingAgent:
     ) -> tuple[list[PropertyListing], dict[str, int]]:
         property_type = "kontrakan" if status_pernikahan == "menikah" else "kost"
 
-        async with httpx.AsyncClient() as client:
-            tasks = [
-                agent.search_and_analyze(
-                    client, location, budget_min, budget_max, property_type, limit_per_source,
-                )
-                for agent in self.service_agents
-            ]
-            results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
+        applicable_agents = [agent for agent in self.service_agents if agent.supports(property_type)]
+        tasks = [
+            agent.search(location, budget_min, budget_max, property_type, limit_per_source)
+            for agent in applicable_agents
+        ]
+        results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
 
         listings: list[PropertyListing] = []
-        source_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {
+            agent.source_name: 0 for agent in self.service_agents
+        }
         for idx, result in enumerate(results_per_source):
-            agent_name = self.service_agents[idx].source_name
+            agent_name = applicable_agents[idx].source_name
             if isinstance(result, list):
                 valid = [l for l in result if self._is_valid_listing(l, location, budget_min, budget_max, property_type)]
                 source_counts[agent_name] = len(valid)
@@ -176,6 +218,9 @@ class HousingAgent:
                     len(valid),
                 )
                 for listing in valid:
+                    # Tag the listing with the requested property type so the response
+                    # shows the correct type (Kost/Kontrakan) instead of defaulting to Kost.
+                    listing.property_type = property_type.title()
                     logger.info(
                         "[%-20s] listing: title=%s price=%s source=%s url=%s image=%s",
                         agent_name,
@@ -231,10 +276,10 @@ class HousingAgent:
         formatted = []
         for i, listing in enumerate(listings[:10], 1):
             formatted.append({
-                "nama": listing.title,
+                "nama": sanitize_text(listing.title),
                 "tipe": listing.property_type or "kost",
                 "harga": listing.price,
-                "lokasi": listing.location,
+                "lokasi": sanitize_text(listing.location),
                 "sumber": listing.source,
                 "url": listing.url,
             })
@@ -244,18 +289,12 @@ class HousingAgent:
             "user_information": user_info,
         })
 
-    def _get_prompt(self, language: str, prompt_id: str) -> str:
-        lang = (language or "id").lower()
-        if lang == "en":
-            return getattr(settings, f"{prompt_id}_EN", getattr(settings, prompt_id, ""))
-        return getattr(settings, prompt_id, "")
-
     def generate_recommendation_text(self, details_json: str, language: str = "id") -> str:
         lang = (language or "id").lower()
         messages = [
-            {"role": "system", "content": self._get_prompt(lang, "SYSTEM_PROMPT")},
-            {"role": "system", "content": self._get_prompt(lang, "FILTER_PROMPT")},
-            {"role": "system", "content": self._get_prompt(lang, "CHECK_RECOMENDATION_PROMPT")},
+            {"role": "system", "content": prompts.get(lang, "system")},
+            {"role": "system", "content": prompts.get(lang, "filter")},
+            {"role": "system", "content": prompts.get(lang, "check_recommendation")},
             {"role": "user", "content": details_json},
         ]
 
@@ -273,10 +312,10 @@ class HousingAgent:
                 for chunk in stream
                 if chunk.choices[0].delta.content
             )
-            return response_text
+            return sanitize_text(response_text)
         except Exception as e:
             logger.error("LLM recommendation generation failed: %s", e)
-            return self._fallback_text(listings_json=details_json, language=language)
+            return sanitize_text(self._fallback_text(listings_json=details_json, language=language))
 
     def _fallback_text(self, listings_json: str, language: str = "id") -> str:
         lang = (language or "id").lower()
@@ -316,7 +355,7 @@ class HousingAgent:
             else:
                 price_label = f"Rp{listing.price:,}" if listing.price else "Harga nego"
             products.append({
-                "nama_tempat": listing.title,
+                "nama_tempat": sanitize_text(listing.title),
                 "tipe": listing.property_type or "Kost",
                 "harga": price_label,
                 "lokasi": listing.location,
@@ -327,12 +366,14 @@ class HousingAgent:
         return products
 
     async def get_detail(self, url: str, source: str) -> PropertyDetail:
-        async with httpx.AsyncClient() as client:
-            for agent in self.service_agents:
-                if agent.source_name == source:
-                    detail = await agent.get_detail(client, url)
-                    if detail.title or detail.images:
-                        return detail
+        for agent in self.service_agents:
+            if agent.source_name == source:
+                detail = await agent.get_detail(url)
+                if detail.title or detail.images:
+                    detail.title = sanitize_text(detail.title)
+                    detail.location = sanitize_text(detail.location)
+                    detail.description = sanitize_text(detail.description)
+                    return detail
         return PropertyDetail(
             title="",
             price=0,
@@ -350,24 +391,11 @@ class HousingAgent:
         language: str = "id",
     ) -> str:
         lang = (language or "id").lower()
-        prompt = (
-            "Berikan 3 rekomendasi tempat tinggal (kost/kontrakan) yang cocok "
-            f"berdasarkan data user: {json.dumps(user_info, ensure_ascii=False)}. "
-            "Jawab dalam 2 paragraf: paragraf pertama ringkasan kebutuhan user, "
-            "paragraf kedua rekomendasi tempat beserta alasannya. "
-            "Jangan berikan format daftar/point. "
-            "Gunakan bahasa Indonesia santai."
-        ) if lang == "id" else (
-            "Provide 3 accommodation recommendations (boarding house/rented house) that match "
-            f"the user data: {json.dumps(user_info, ensure_ascii=False)}. "
-            "Answer in 2 paragraphs: first paragraph summarizes user needs, "
-            "second paragraph gives recommendations with reasons. "
-            "Do not use bullet points. Keep it casual and friendly."
-        )
-
+        prompt = prompts.format(lang, "text_recommendation",
+                                user_info=json.dumps(user_info, ensure_ascii=False))
         messages = [
-            {"role": "system", "content": self._get_prompt(lang, "SYSTEM_PROMPT")},
-            {"role": "system", "content": self._get_prompt(lang, "FILTER_PROMPT")},
+            {"role": "system", "content": prompts.get(lang, "system")},
+            {"role": "system", "content": prompts.get(lang, "filter")},
             {"role": "user", "content": prompt},
         ]
 
@@ -380,14 +408,14 @@ class HousingAgent:
                 top_p=0.7,
                 stream=True,
             )
-            return "".join(
+            return sanitize_text("".join(
                 chunk.choices[0].delta.content
                 for chunk in stream
                 if chunk.choices[0].delta.content
-            )
+            ))
         except Exception as e:
             logger.error("LLM text recommendation failed: %s", e)
-            return self._fallback_text(json.dumps({"tempat_rekomendasi": [], "user_information": user_info}), language)
+            return sanitize_text(self._fallback_text(json.dumps({"tempat_rekomendasi": [], "user_information": user_info}), language))
 
     async def run(
         self,
