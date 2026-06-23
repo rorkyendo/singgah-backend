@@ -158,6 +158,26 @@ class HousingAgent:
             })
         return products
 
+    def _generate_llm_products(self, user_message: str, user_info: dict) -> list[dict]:
+        from app.controllers.orchestrator_controller import recommendationMessages
+
+        details = {
+            'message': user_message,
+            'user_information': user_info,
+        }
+        llm_response = recommendationMessages(json.dumps(details))
+        tempat_list = [t.strip() for t in llm_response.split(",") if t.strip()]
+
+        products = []
+        for tempat_name in tempat_list:
+            products.append({
+                "nama_tempat": tempat_name,
+                "tipe": "Kost" if "kost" in tempat_name.lower() else "Kontrakan",
+                "harga": "Sesuai budget",
+                "lokasi": user_info.get("lokasi", ""),
+            })
+        return products
+
     async def run(
         self,
         user_message: str,
@@ -179,10 +199,17 @@ class HousingAgent:
 
         ranked = self.rank_listings(budget_min, budget_max)
 
-        details_json = self.format_for_llm(ranked, user_info)
-        check_result = self.generate_recommendation_text(details_json)
+        if ranked:
+            details_json = self.format_for_llm(ranked, user_info)
+            products = self.listings_to_products(ranked)
+        else:
+            products = self._generate_llm_products(user_message, user_info)
+            details_json = json.dumps({
+                "tempat_rekomendasi": [{"nama": p["nama_tempat"], "tipe": p["tipe"]} for p in products],
+                "user_information": user_info,
+            })
 
-        products = self.listings_to_products(ranked)
+        check_result = self.generate_recommendation_text(details_json)
 
         return {
             "rc": "200",
