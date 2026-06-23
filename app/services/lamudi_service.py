@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.lamudi.co.id"
 
-# Lamudi location slug map
+# Lamudi location slug map: province/city
 LAMUDI_LOCATION_MAP: dict[str, str] = {
     "gambir": "jakarta/jakarta-pusat",
     "jakarta pusat": "jakarta/jakarta-pusat",
@@ -21,13 +21,13 @@ LAMUDI_LOCATION_MAP: dict[str, str] = {
     "jakarta timur": "jakarta/jakarta-timur",
     "jakarta utara": "jakarta/jakarta-utara",
     "depok": "jawa-barat/depok",
-    "bogor": "jawa-barat/kota-bogor",
-    "bekasi": "jawa-barat/kota-bekasi",
-    "tangerang": "banten/kota-tangerang",
-    "bandung": "jawa-barat/kota-bandung",
-    "yogyakarta": "di-yogyakarta/kota-yogyakarta",
-    "surabaya": "jawa-timur/kota-surabaya",
-    "semarang": "jawa-tengah/kota-semarang",
+    "bogor": "jawa-barat/bogor",
+    "bekasi": "jawa-barat/bekasi",
+    "tangerang": "banten/tangerang",
+    "bandung": "jawa-barat/bandung",
+    "yogyakarta": "yogyakarta",
+    "surabaya": "jawa-timur/surabaya",
+    "semarang": "jawa-tengah/semarang",
 }
 
 
@@ -43,6 +43,16 @@ class LamudiScraper(BaseScraper):
                 return v
         return key.replace(" ", "-")
 
+    def _category_path(self, property_type: str) -> str:
+        """Map property_type to Lamudi URL category."""
+        t = (property_type or "kost").lower()
+        if t in ("apartemen", "apartment"):
+            return "apartemen"
+        # Lamudi does not have kost category; fallback to rumah
+        if t == "kost":
+            return "rumah"
+        return "rumah"
+
     async def search(
         self,
         client: httpx.AsyncClient,
@@ -54,8 +64,9 @@ class LamudiScraper(BaseScraper):
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
         slug = self._location_slug(location)
-        # Lamudi URL: /sewa/{region}/{city}/rumah/
-        search_url = f"{BASE_URL}/sewa/{slug}/rumah/"
+        category = self._category_path(property_type)
+        # Lamudi URL: /sewa/{region}/{city}/{category}/
+        search_url = f"{BASE_URL}/sewa/{slug}/{category}/"
         logger.info("[Lamudi] search URL: %s", search_url)
 
         try:

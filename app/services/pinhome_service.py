@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -27,10 +28,13 @@ class PinhomeScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        # Pinhome has a dedicated /kost/ page with JSON-LD data
-        search_url = f"{BASE_URL}/kost/"
+        # Pinhome supports location via ?keyword= parameter
+        # Category mapping: kost -> /kost/, kontrakan -> /sewa/rumah/
         if property_type == "kontrakan":
-            search_url = f"{BASE_URL}/sewa/rumah"
+            path = "/sewa/rumah"
+        else:
+            path = "/kost"
+        search_url = f"{BASE_URL}{path}/?keyword={quote(location.lower())}"
 
         logger.info("[Pinhome] search URL: %s", search_url)
 
@@ -45,12 +49,12 @@ class PinhomeScraper(BaseScraper):
             if resp.status_code != 200:
                 return results
 
-            html = resp.text
+            page_html = resp.text
 
             # Parse JSON-LD ItemList
             ld_blocks = re.findall(
                 r'<script type="application/ld\+json">(.*?)</script>',
-                html, re.DOTALL,
+                page_html, re.DOTALL,
             )
             logger.info("[Pinhome] JSON-LD blocks: %d", len(ld_blocks))
 
@@ -86,20 +90,23 @@ class PinhomeScraper(BaseScraper):
                 addr_region = addr.get("addressRegion", "")
                 item_location = f"{addr_locality}, {addr_region}".strip(", ")
 
-                # Filter by location keyword and budget
-                loc_match = (
-                    location.lower() in name.lower()
-                    or location.lower() in item_location.lower()
-                    or not location
-                )
-                budget_ok = (budget_min <= price <= budget_max) if price else True
+                # Filter by budget; keyword already applied by Pinhome
+                # Allow yearly rents if monthly equivalent (price/12) fits budget
+                if price:
+                    budget_ok = (
+                        budget_min <= price <= budget_max
+                        or budget_min <= price // 12 <= budget_max
+                    )
+                else:
+                    budget_ok = True
 
                 logger.info(
                     "[Pinhome] item: name=%s price=%s loc=%s img=%s match=%s",
-                    name[:50], price, item_location[:30], bool(image), loc_match and budget_ok,
+                    name[:50], price, item_location[:30], bool(image), budget_ok,
                 )
 
-                if loc_match and budget_ok:
+                if budget_ok:
+                    name = html.unescape(name)
                     results.append(PropertyListing(
                         title=name or f"Kost di {location}",
                         price=price,
@@ -134,12 +141,12 @@ class PinhomeScraper(BaseScraper):
             if resp.status_code != 200:
                 return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
-            html = resp.text
+            page_html = resp.text
 
             # Try JSON-LD first
             ld_blocks = re.findall(
                 r'<script type="application/ld\+json">(.*?)</script>',
-                html, re.DOTALL,
+                page_html, re.DOTALL,
             )
             for block in ld_blocks:
                 try:
@@ -158,16 +165,16 @@ class PinhomeScraper(BaseScraper):
                     continue
 
             # Fallback to HTML parsing
-            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE)
+            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', page_html, re.DOTALL | re.IGNORECASE)
             title = re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else ""
 
-            price_text = re.search(r'Rp\s*([\d.,]+)', html, re.IGNORECASE)
+            price_text = re.search(r'Rp\s*([\d.,]+)', page_html, re.IGNORECASE)
             price = self._clean_price(price_text.group(1)) if price_text else 0
 
-            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
+            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', page_html, re.DOTALL | re.IGNORECASE)
             description = re.sub(r"<[^>]+>", " ", desc_match.group(1)).strip() if desc_match else ""
 
-            images = self._extract_image_urls(html, BASE_URL, 10)
+            images = self._extract_image_urls(page_html, BASE_URL, 10)
 
             logger.info("[Pinhome] detail: title=%s price=%s images=%d", title, price, len(images))
 

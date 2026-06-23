@@ -28,6 +28,10 @@ class MamikostScraper(BaseScraper):
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
 
+        if (property_type or "kost").lower() != "kost":
+            logger.info("[Mamikost] skipped: only kost category is supported")
+            return results
+
         body = {
             "take": limit * 3,
             "page": 1,
@@ -81,17 +85,24 @@ class MamikostScraper(BaseScraper):
                 city = room.get("city", "")
                 item_location = f"{subdistrict}, {city}".strip(", ")
 
-                logger.info(
-                    "[Mamikost] room: title=%s price=%s img=%s loc=%s",
-                    title[:40], price, bool(thumbnail), item_location[:30],
+                # Mamikost API may return broad results; keep only matching location
+                loc_match = (
+                    not location
+                    or location.lower() in item_location.lower()
+                    or location.lower() in title.lower()
                 )
 
-                if title and (budget_min <= price <= budget_max or price == 0):
+                logger.info(
+                    "[Mamikost] room: title=%s price=%s img=%s loc=%s match=%s",
+                    title[:40], price, bool(thumbnail), item_location[:30], loc_match,
+                )
+
+                if title and loc_match and (budget_min <= price <= budget_max or price == 0):
                     results.append(PropertyListing(
                         title=title,
                         price=price,
                         location=item_location or location,
-                        property_type="kost",
+                        property_type=property_type,
                         source=self.source_name,
                         url=item_url,
                         image_url=thumbnail,

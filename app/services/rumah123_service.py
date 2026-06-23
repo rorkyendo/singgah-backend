@@ -53,6 +53,25 @@ class Rumah123Scraper(BaseScraper):
             return unquote(m.group(1))
         return srcset
 
+    def _category_path(self, property_type: str) -> str:
+        """Map property_type to Rumah123 URL category."""
+        t = (property_type or "kost").lower()
+        if t == "kost":
+            return "kost"
+        if t in ("apartemen", "apartment"):
+            return "apartemen"
+        # Default to rumah for kontrakan / rumah
+        return "rumah"
+
+    def _build_search_url(self, location: str, property_type: str) -> str:
+        slug = self._location_slug(location)
+        category = self._category_path(property_type)
+        if category == "kost":
+            # Rumah123 kost uses /kost/di-{location}/
+            return f"{BASE_URL}/kost/di-{slug}/"
+        # kontrakan/rumah/apartemen use /sewa/{location}/{category}/
+        return f"{BASE_URL}/sewa/{slug}/{category}/"
+
     async def search(
         self,
         client: httpx.AsyncClient,
@@ -63,9 +82,7 @@ class Rumah123Scraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        slug = self._location_slug(location)
-        # Use /sewa/ for rent, /jual/ for sale
-        search_url = f"{BASE_URL}/sewa/{slug}/rumah/"
+        search_url = self._build_search_url(location, property_type)
         logger.info("[Rumah123] search URL: %s", search_url)
 
         try:
@@ -78,9 +95,9 @@ class Rumah123Scraper(BaseScraper):
             logger.info("[Rumah123] status=%s", resp.status_code)
 
             if resp.status_code != 200:
-                # Try /jual/ as fallback
-                search_url = f"{BASE_URL}/jual/{slug}/rumah/"
-                logger.info("[Rumah123] fallback to jual URL: %s", search_url)
+                # Fallback to rumah category
+                search_url = self._build_search_url(location, "rumah")
+                logger.info("[Rumah123] fallback URL: %s", search_url)
                 resp = await client.get(
                     search_url,
                     headers=self._build_headers(),
@@ -102,7 +119,7 @@ class Rumah123Scraper(BaseScraper):
             for block in ld_blocks:
                 try:
                     data = json.loads(block)
-                    if data.get("@type") == "ItemList":
+                    if isinstance(data, dict) and data.get("@type") == "ItemList":
                         jsonld_items = data.get("itemListElement", [])
                         break
                 except json.JSONDecodeError:
@@ -162,12 +179,19 @@ class Rumah123Scraper(BaseScraper):
 
                 # Price: find near link in HTML
                 if not title:
-                    # Fallback: extract from URL slug
-                    slug_part = link.split("/properti/")[-1].rstrip("/")
-                    # Remove hos/hor ID suffix
-                    slug_part = re.sub(r'-hos\d+$', '', slug_part)
-                    slug_part = re.sub(r'-hor\d+$', '', slug_part)
-                    title = slug_part.replace("-", " ").title()
+                    # Try title attribute from the link itself
+                    link_attr_match = re.search(
+                        rf'href="{re.escape(link)}"[^>]*title="([^"]+)"',
+                        html, re.IGNORECASE,
+                    )
+                    if link_attr_match:
+                        title = link_attr_match.group(1).strip()
+                    else:
+                        # Fallback: extract from URL slug
+                        slug_part = link.split("/properti/")[-1].rstrip("/")
+                        # Remove hos/hor/ksr ID suffix
+                        slug_part = re.sub(r'-(?:hos|hor|ksr)\d+$', '', slug_part)
+                        title = slug_part.replace("-", " ").title()
 
                 # Price: find data-testid="ldp-text-price" before link
                 link_pos = html.find(f'href="{link}"')
