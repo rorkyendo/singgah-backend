@@ -98,7 +98,30 @@ class BaseScraper(ABC):
                     urls.add(src)
         return list(urls)[:limit]
 
-    def _extract_thumbnail(self, html: str) -> str:
+    def _extract_thumbnail(self, html: str, item_url: str = "") -> str:
+        if item_url:
+            # Find the first <img> tag within 2000 chars before or after the item URL
+            escaped_url = re.escape(item_url)
+            for pattern in [
+                r'.{0,2000}' + escaped_url + r'.{0,2000}',
+                r'.{0,2000}' + escaped_url + r'.{0,2000}',
+            ]:
+                match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+                if match:
+                    snippet = match.group(0)
+                    for img_pattern in [
+                        r'<img[^>]+src="(https?://[^"]+)"[^>]*>',
+                        r'<img[^>]+data-src="(https?://[^"]+)"[^>]*>',
+                        r'<img[^>]+src="(/[^"]+)"[^>]*>',
+                        r'<img[^>]+data-src="(/[^"]+)"[^>]*>',
+                    ]:
+                        img_matches = re.findall(img_pattern, snippet, re.IGNORECASE)
+                        for src in img_matches:
+                            if src.startswith("/"):
+                                src = "https://" + self._domain_from_url(item_url) + src
+                            if src.startswith("http") and not src.endswith(".svg"):
+                                return src
+
         patterns = [
             r'<img[^>]+src="(https?://[^"]+)"[^>]*>',
             r'<img[^>]+data-src="(https?://[^"]+)"[^>]*>',
@@ -109,3 +132,7 @@ class BaseScraper(ABC):
                 if src.startswith("http") and not src.endswith(".svg"):
                     return src
         return ""
+
+    def _domain_from_url(self, url: str) -> str:
+        match = re.search(r'https?://([^/]+)', url)
+        return match.group(1) if match else ""

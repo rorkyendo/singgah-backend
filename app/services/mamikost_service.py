@@ -52,7 +52,7 @@ class MamikostScraper(BaseScraper):
                 price = self._clean_price(match[2])
 
                 if budget_min <= price <= budget_max or price == 0:
-                    thumbnail = self._extract_thumbnail(match[0])
+                    thumbnail = self._extract_thumbnail(html, item_url)
                     results.append(PropertyListing(
                         title=title or f"Kost di {location}",
                         price=price,

@@ -60,7 +60,7 @@ class OLXScraper(BaseScraper):
                 price = self._clean_price(price_text)
 
                 if budget_min <= price <= budget_max or price == 0:
-                    thumbnail = self._extract_thumbnail(match[0] if len(match) > 3 else html)
+                    thumbnail = self._extract_thumbnail(html, item_url)
                     results.append(PropertyListing(
                         title=title or f"{property_type.title()} di {location}",
                         price=price,
