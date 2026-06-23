@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from app.core.config import settings
 from app.services.base import PropertyListing, PropertyDetail
-from app.services.olx_service import OLXAgent
+from app.services.rumah123_service import Rumah123Agent
 from app.services.mamikost_service import MamikostAgent
 from app.services.pinhome_service import PinhomeAgent
 from app.services.lamudi_service import LamudiAgent
@@ -25,7 +25,7 @@ class HousingAgent:
     def __init__(self):
         self.scraped_listings: list[PropertyListing] = []
         self.service_agents = [
-            OLXAgent(),
+            Rumah123Agent(),
             MamikostAgent(),
             PinhomeAgent(),
             LamudiAgent(),

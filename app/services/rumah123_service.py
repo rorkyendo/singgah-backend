@@ -299,11 +299,7 @@ class Rumah123Scraper(BaseScraper):
             return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
 
-# Keep old names for backward compatibility
-OLXScraper = Rumah123Scraper
-
-
-class OLXAgent:
+class Rumah123Agent:
     source_name = "Rumah123"
 
     def __init__(self):

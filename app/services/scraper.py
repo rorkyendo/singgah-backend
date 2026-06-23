@@ -3,7 +3,7 @@ import asyncio
 import httpx
 
 from app.services.base import BaseScraper, PropertyListing
-from app.services.olx_service import OLXScraper
+from app.services.rumah123_service import Rumah123Scraper
 from app.services.mamikost_service import MamikostScraper
 from app.services.pinhome_service import PinhomeScraper
 from app.services.lamudi_service import LamudiScraper
@@ -18,7 +18,7 @@ async def run_all_scrapers(
     limit_per_source: int = 3,
 ) -> list[PropertyListing]:
     scrapers: list[BaseScraper] = [
-        OLXScraper(),
+        Rumah123Scraper(),
         MamikostScraper(),
         PinhomeScraper(),
         LamudiScraper(),
