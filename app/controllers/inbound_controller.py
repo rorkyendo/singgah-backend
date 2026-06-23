@@ -6,7 +6,8 @@ from app.schemas.chat import ChatHistory
 from app.controllers.user_controller import get_user
 from app.controllers.orchestrator_controller import (
     greetingsMessage, checkRecomendatationResultMessage,
-    consultationMessages, checkIntenMessage, recommendationMessages
+    consultationMessages, checkIntenMessage, recommendationMessages,
+    extractSearchParams
 )
 from app.services.agent import HousingAgent
 import json
@@ -33,10 +34,11 @@ async def send_message(db: Session, data: ChatHistory):
 
     if intent == "rekomendasi":
         agent = HousingAgent()
+        search_params = extractSearchParams(data.message, get_user_data or {}, language)
         try:
             response = await agent.run(
                 user_message=data.message,
-                user_info=get_user_data or {},
+                user_info=search_params,
                 language=language,
             )
         except Exception as e:
