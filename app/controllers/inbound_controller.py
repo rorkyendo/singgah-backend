@@ -25,7 +25,8 @@ async def send_message(db: Session, data: ChatHistory):
     db.commit()
     db.refresh(history)
 
-    intent = checkIntenMessage(data.message)
+    language = data.language or "id"
+    intent = checkIntenMessage(data.message, language)
     print("Intent: ", intent)
     get_user_data = get_user(db, data.session)
     response = {}
@@ -36,6 +37,7 @@ async def send_message(db: Session, data: ChatHistory):
             response = await agent.run(
                 user_message=data.message,
                 user_info=get_user_data or {},
+                language=language,
             )
         except Exception as e:
             print(f"Agent scraping failed: {e}, falling back to LLM")
@@ -43,7 +45,7 @@ async def send_message(db: Session, data: ChatHistory):
                 'message': data.message,
                 'user_information': get_user_data
             }
-            llm_response = recommendationMessages(json.dumps(details))
+            llm_response = recommendationMessages(json.dumps(details), language)
             print("rekomendasi (fallback): " + llm_response)
             tempat_list = llm_response.split(",")
 
@@ -62,7 +64,7 @@ async def send_message(db: Session, data: ChatHistory):
                 'tempat_rekomendasi': [{"nama": p["nama_tempat"], "tipe": p["tipe"]} for p in products],
                 'user_information': get_user_data
             }
-            check_result = checkRecomendatationResultMessage(json.dumps(details_check))
+            check_result = checkRecomendatationResultMessage(json.dumps(details_check), language)
 
             response = {
                 "rc": "200",
@@ -75,7 +77,7 @@ async def send_message(db: Session, data: ChatHistory):
             'message': data.message,
             'user_information': get_user_data
         }
-        consultation = consultationMessages(json.dumps(details))
+        consultation = consultationMessages(json.dumps(details), language)
         response = {
             "rc": "200",
             "messages": [line for line in consultation.splitlines() if line.strip()],
@@ -85,7 +87,7 @@ async def send_message(db: Session, data: ChatHistory):
     else:
         response = {
             "rc": "200",
-            "messages": [line for line in greetingsMessage(data.message).splitlines() if line.strip()],
+            "messages": [line for line in greetingsMessage(data.message, language).splitlines() if line.strip()],
             "is_product": False,
             "product": []
         }

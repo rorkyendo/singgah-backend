@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class ChatHistory(BaseModel):
     is_user: str
@@ -6,3 +6,4 @@ class ChatHistory(BaseModel):
     message: str
     read: str
     replied: str
+    language: str = Field(default="id", pattern="^(id|en)$")

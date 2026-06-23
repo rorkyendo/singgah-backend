@@ -118,11 +118,18 @@ class HousingAgent:
             "user_information": user_info,
         })
 
-    def generate_recommendation_text(self, details_json: str) -> str:
+    def _get_prompt(self, language: str, prompt_id: str) -> str:
+        lang = (language or "id").lower()
+        if lang == "en":
+            return getattr(settings, f"{prompt_id}_EN", getattr(settings, prompt_id, ""))
+        return getattr(settings, prompt_id, "")
+
+    def generate_recommendation_text(self, details_json: str, language: str = "id") -> str:
+        lang = (language or "id").lower()
         messages = [
-            {"role": "system", "content": settings.SYSTEM_PROMPT},
-            {"role": "system", "content": settings.FILTER_PROMPT},
-            {"role": "system", "content": settings.CHECK_RECOMENDATION_PROMPT},
+            {"role": "system", "content": self._get_prompt(lang, "SYSTEM_PROMPT")},
+            {"role": "system", "content": self._get_prompt(lang, "FILTER_PROMPT")},
+            {"role": "system", "content": self._get_prompt(lang, "CHECK_RECOMENDATION_PROMPT")},
             {"role": "user", "content": details_json},
         ]
 
@@ -143,16 +150,22 @@ class HousingAgent:
             return response_text
         except Exception as e:
             logger.error("LLM recommendation generation failed: %s", e)
-            return self._fallback_text(listings_json=details_json)
+            return self._fallback_text(listings_json=details_json, language=language)
 
-    def _fallback_text(self, listings_json: str) -> str:
+    def _fallback_text(self, listings_json: str, language: str = "id") -> str:
+        lang = (language or "id").lower()
         try:
             data = json.loads(listings_json)
             places = data.get("tempat_rekomendasi", [])
             if not places:
+                if lang == "en":
+                    return "Sorry, there are no recommendations available at the moment."
                 return "Maaf, belum ada rekomendasi yang tersedia saat ini."
 
-            lines = ["Berikut rekomendasi tempat tinggal yang cocok untukmu:"]
+            if lang == "en":
+                lines = ["Here are accommodation recommendations that suit you:"]
+            else:
+                lines = ["Berikut rekomendasi tempat tinggal yang cocok untukmu:"]
             for p in places[:5]:
                 price_str = f"Rp{p['harga']:,}" if p.get("harga") else "Harga nego"
                 lines.append(
@@ -161,6 +174,8 @@ class HousingAgent:
                 )
             return "\n".join(lines)
         except Exception:
+            if lang == "en":
+                return "Here are some accommodation recommendations that might suit you."
             return "Berikut beberapa rekomendasi tempat tinggal yang mungkin cocok untukmu."
 
     def listings_to_products(self, listings: list[PropertyListing]) -> list[dict]:
@@ -176,14 +191,14 @@ class HousingAgent:
             })
         return products
 
-    def _generate_llm_products(self, user_message: str, user_info: dict) -> list[dict]:
+    def _generate_llm_products(self, user_message: str, user_info: dict, language: str = "id") -> list[dict]:
         from app.controllers.orchestrator_controller import recommendationMessages
 
         details = {
             'message': user_message,
             'user_information': user_info,
         }
-        llm_response = recommendationMessages(json.dumps(details))
+        llm_response = recommendationMessages(json.dumps(details), language)
         tempat_list = [t.strip() for t in llm_response.split(",") if t.strip()]
 
         products = []
@@ -200,6 +215,7 @@ class HousingAgent:
         self,
         user_message: str,
         user_info: dict,
+        language: str = "id",
         limit_per_source: int = 3,
     ) -> dict:
         location = user_info.get("lokasi", "Jakarta")
@@ -221,13 +237,13 @@ class HousingAgent:
             details_json = self.format_for_llm(ranked, user_info)
             products = self.listings_to_products(ranked)
         else:
-            products = self._generate_llm_products(user_message, user_info)
+            products = self._generate_llm_products(user_message, user_info, language)
             details_json = json.dumps({
                 "tempat_rekomendasi": [{"nama": p["nama_tempat"], "tipe": p["tipe"]} for p in products],
                 "user_information": user_info,
             })
 
-        check_result = self.generate_recommendation_text(details_json)
+        check_result = self.generate_recommendation_text(details_json, language)
 
         return {
             "rc": "200",
