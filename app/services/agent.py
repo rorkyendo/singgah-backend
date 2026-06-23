@@ -6,7 +6,7 @@ import httpx
 from openai import OpenAI
 
 from app.core.config import settings
-from app.services.base import PropertyListing
+from app.services.base import PropertyListing, PropertyDetail
 from app.services.olx_service import OLXAgent
 from app.services.mamikost_service import MamikostAgent
 from app.services.pinhome_service import PinhomeAgent
@@ -188,8 +188,26 @@ class HousingAgent:
                 "lokasi": listing.location,
                 "sumber": listing.source,
                 "url": listing.url,
+                "image": listing.image_url,
             })
         return products
+
+    async def get_detail(self, url: str, source: str) -> PropertyDetail:
+        async with httpx.AsyncClient() as client:
+            for agent in self.service_agents:
+                if agent.source_name == source:
+                    detail = await agent.get_detail(client, url)
+                    if detail.title or detail.images:
+                        return detail
+        return PropertyDetail(
+            title="",
+            price=0,
+            location="",
+            description="",
+            images=[],
+            source=source,
+            url=url,
+        )
 
     def _generate_llm_products(self, user_message: str, user_info: dict, language: str = "id") -> list[dict]:
         from app.controllers.orchestrator_controller import recommendationMessages

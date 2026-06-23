@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.orm import Session
 from app.schemas.chat import ChatHistory
 from app.controllers.inbound_controller import (
-    send_message, delete_message, update_message, get_chat_history_by_session
+    send_message, delete_message, update_message, get_chat_history_by_session,
+    get_property_detail
 )
 from app.db.session import get_db
 import json
@@ -31,6 +32,10 @@ def update_message_route(message_id: int, data: ChatHistory, db: Session = Depen
 def get_history_route(session_id: str, db: Session = Depends(get_db)):
     history = get_chat_history_by_session(db, session_id)
     return history
+
+@router.post("/property-detail")
+async def property_detail_route(data: dict):
+    return await get_property_detail(data.get("url", ""), data.get("source", ""))
 
 @router.websocket("/ws/send")
 async def websocket_send_message(websocket: WebSocket):

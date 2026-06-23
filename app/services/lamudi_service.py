@@ -6,7 +6,7 @@ import httpx
 from openai import OpenAI
 
 from app.core.config import settings
-from app.services.base import BaseScraper, PropertyListing
+from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class LamudiScraper(BaseScraper):
                 price = self._clean_price(match[2])
 
                 if budget_min <= price <= budget_max or price == 0:
+                    thumbnail = self._extract_thumbnail(match[0])
                     results.append(PropertyListing(
                         title=title or f"{property_type.title()} di {location}",
                         price=price,
@@ -65,12 +66,52 @@ class LamudiScraper(BaseScraper):
                         property_type=property_type,
                         source=self.source_name,
                         url=item_url,
+                        image_url=thumbnail,
+                        images=[thumbnail] if thumbnail else [],
                     ))
 
         except Exception:
             pass
 
         return results
+
+    async def get_detail(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+    ) -> PropertyDetail:
+        try:
+            resp = await client.get(
+                url,
+                headers=self._build_headers(),
+                timeout=self.timeout,
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
+
+            html = resp.text
+            title = re.sub(r"<[^>]+>", "", re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE).group(1)).strip() if re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE) else ""
+            price_text = re.search(r'Rp\s*([\d.,]+)', html, re.IGNORECASE)
+            price = self._clean_price(price_text.group(1)) if price_text else 0
+            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
+            description = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip() if desc_match else ""
+
+            base_url = "https://www.lamudi.co.id"
+            images = self._extract_image_urls(html, base_url, 10)
+
+            return PropertyDetail(
+                title=title,
+                price=price,
+                location="",
+                description=description,
+                images=images,
+                source=self.source_name,
+                url=url,
+            )
+        except Exception as e:
+            logger.warning("Lamudi detail failed: %s", e)
+            return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
 
 class LamudiAgent:
@@ -100,6 +141,9 @@ class LamudiAgent:
             listings = self._llm_fallback(location, budget_min, budget_max, property_type, limit)
 
         return listings
+
+    async def get_detail(self, client: httpx.AsyncClient, url: str) -> PropertyDetail:
+        return await self.scraper.get_detail(client, url)
 
     def _llm_fallback(
         self,

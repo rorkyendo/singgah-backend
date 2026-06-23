@@ -7,7 +7,7 @@ import httpx
 from openai import OpenAI
 
 from app.core.config import settings
-from app.services.base import BaseScraper, PropertyListing
+from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,8 @@ class FacebookMarketplaceScraper(BaseScraper):
                                     property_type="",
                                     source=self.source_name,
                                     url="",
+                                    image_url="",
+                                    images=[],
                                 ))
                 for key, val in obj.items():
                     _walk(val, depth + 1)
@@ -96,6 +98,17 @@ class FacebookMarketplaceScraper(BaseScraper):
 
         _walk(data)
         return results
+
+    async def get_detail(self, client: httpx.AsyncClient, url: str) -> PropertyDetail:
+        return PropertyDetail(
+            title="",
+            price=0,
+            location="",
+            description="",
+            images=[],
+            source=self.source_name,
+            url=url,
+        )
 
 
 class FacebookAgent:
@@ -125,6 +138,9 @@ class FacebookAgent:
             listings = self._llm_fallback(location, budget_min, budget_max, property_type, limit)
 
         return listings
+
+    async def get_detail(self, client: httpx.AsyncClient, url: str) -> PropertyDetail:
+        return await self.scraper.get_detail(client, url)
 
     def _llm_fallback(
         self,

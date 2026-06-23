@@ -95,6 +95,20 @@ async def send_message(db: Session, data: ChatHistory):
     print(response)
     return response
 
+async def get_property_detail(url: str, source: str):
+    agent = HousingAgent()
+    detail = await agent.get_detail(url, source)
+    return {
+        "rc": "200",
+        "title": detail.title,
+        "price": detail.price,
+        "location": detail.location,
+        "description": detail.description,
+        "images": detail.images,
+        "source": detail.source,
+        "url": detail.url,
+    }
+
 def delete_message(db: Session, message_id: int):
     history = db.query(History).filter(History.chat_id == message_id).first()
     if history:
