@@ -92,7 +92,7 @@ async def send_message(db: Session, data: ChatHistory):
             "product": []
         }
 
-    print(response)
+    print("[FINAL RESPONSE]", json.dumps(response, ensure_ascii=False, default=str))
     return response
 
 async def get_property_detail(url: str, source: str):

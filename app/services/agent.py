@@ -52,12 +52,30 @@ class HousingAgent:
             results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
 
         self.scraped_listings = []
-        for result in results_per_source:
+        for idx, result in enumerate(results_per_source):
+            agent_name = self.service_agents[idx].source_name
             if isinstance(result, list):
+                logger.info(
+                    "[%-20s] found %d listings",
+                    agent_name,
+                    len(result),
+                )
+                for listing in result:
+                    logger.info(
+                        "[%-20s] listing: title=%s price=%s source=%s url=%s image=%s",
+                        agent_name,
+                        listing.title,
+                        listing.price,
+                        listing.source,
+                        listing.url,
+                        listing.image_url,
+                    )
                 self.scraped_listings.extend(result)
+            elif isinstance(result, Exception):
+                logger.warning("[%-20s] error: %s", agent_name, result)
 
         logger.info(
-            "Scraped %d listings from %d sources for %s in %s",
+            "[TOTAL] %d listings from %d sources for %s in %s",
             len(self.scraped_listings),
             len(set(l.source for l in self.scraped_listings)),
             property_type,
@@ -281,17 +299,21 @@ class HousingAgent:
             details_json = self.format_for_llm(ranked, user_info)
             products = self.listings_to_products(ranked)
             check_result = self.generate_recommendation_text(details_json, language)
-            return {
+            response = {
                 "rc": "200",
                 "messages": [line for line in check_result.splitlines() if line.strip()],
                 "is_product": True,
                 "product": products,
             }
+            logger.info("[RESPONSE] is_product=True products=%d", len(products))
+            return response
 
         text_response = self._generate_text_recommendation(user_message, user_info, language)
-        return {
+        response = {
             "rc": "200",
             "messages": [line for line in text_response.splitlines() if line.strip()],
             "is_product": False,
             "product": [],
         }
+        logger.info("[RESPONSE] is_product=False products=0 (fallback text)")
+        return response
