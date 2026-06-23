@@ -243,9 +243,6 @@ class LamudiAgent:
             client, location, budget_min, budget_max, property_type, limit,
         )
 
-        if not listings:
-            listings = self._llm_fallback(location, budget_min, budget_max, property_type, limit)
-
         return listings
 
     async def get_detail(self, client: httpx.AsyncClient, url: str) -> PropertyDetail:

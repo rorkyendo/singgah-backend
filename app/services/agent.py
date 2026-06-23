@@ -22,6 +22,9 @@ llm_client = OpenAI(
 
 
 class HousingAgent:
+    # Sources that are expected to provide real URLs and images
+    RELIABLE_SOURCES = {"Rumah123", "Mamikost", "Pinhome", "Lamudi"}
+
     def __init__(self):
         self.scraped_listings: list[PropertyListing] = []
         self.service_agents = [
@@ -32,6 +35,39 @@ class HousingAgent:
             FacebookAgent(),
         ]
 
+    def _is_valid_listing(self, listing: PropertyListing, location: str) -> bool:
+        """Filter out junk/non-property listings."""
+        title = (listing.title or "").lower().strip()
+        if not title or len(title) < 5:
+            return False
+
+        # Property-related keywords any valid title should contain
+        property_keywords = [
+            "kost", "kos", "kontrakan", "kontrakan", "rumah", "apartemen",
+            "apartment", "sewa", "kamar", "disewakan", "dijual", "cluster",
+            "perumahan", "ruko", "villa", "mewah", "asri", "nyaman", "strategis",
+        ]
+        has_property_keyword = any(k in title for k in property_keywords)
+
+        is_reliable = listing.source in self.RELIABLE_SOURCES
+
+        if not listing.url and not has_property_keyword:
+            # Fake LLM-fallback listings usually have no URL and no property keyword
+            return False
+
+        if not is_reliable and not has_property_keyword:
+            # Facebook/other unreliable sources must have a property keyword
+            return False
+
+        if not is_reliable and (not listing.url or not listing.image_url):
+            # Unreliable sources must provide both URL and image
+            return False
+
+        if listing.price < 0:
+            return False
+
+        return True
+
     async def search_listings(
         self,
         location: str,
@@ -39,7 +75,7 @@ class HousingAgent:
         budget_max: int,
         status_pernikahan: str = "lajang",
         limit_per_source: int = 3,
-    ) -> list[PropertyListing]:
+    ) -> tuple[list[PropertyListing], dict[str, int]]:
         property_type = "kontrakan" if status_pernikahan == "menikah" else "kost"
 
         async with httpx.AsyncClient() as client:
@@ -52,15 +88,19 @@ class HousingAgent:
             results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
 
         self.scraped_listings = []
+        source_counts: dict[str, int] = {}
         for idx, result in enumerate(results_per_source):
             agent_name = self.service_agents[idx].source_name
             if isinstance(result, list):
+                valid = [l for l in result if self._is_valid_listing(l, location)]
+                source_counts[agent_name] = len(valid)
                 logger.info(
-                    "[%-20s] found %d listings",
+                    "[%-20s] raw=%d valid=%d",
                     agent_name,
                     len(result),
+                    len(valid),
                 )
-                for listing in result:
+                for listing in valid:
                     logger.info(
                         "[%-20s] listing: title=%s price=%s source=%s url=%s image=%s",
                         agent_name,
@@ -70,9 +110,12 @@ class HousingAgent:
                         listing.url,
                         listing.image_url,
                     )
-                self.scraped_listings.extend(result)
+                self.scraped_listings.extend(valid)
             elif isinstance(result, Exception):
                 logger.warning("[%-20s] error: %s", agent_name, result)
+                source_counts[agent_name] = 0
+
+        self.source_counts = source_counts
 
         logger.info(
             "[TOTAL] %d listings from %d sources for %s in %s",
@@ -82,7 +125,7 @@ class HousingAgent:
             location,
         )
 
-        return self.scraped_listings
+        return self.scraped_listings, source_counts
 
     def rank_listings(self, budget_min: int, budget_max: int) -> list[PropertyListing]:
         mid_budget = (budget_min + budget_max) / 2
@@ -285,7 +328,7 @@ class HousingAgent:
         budget_max = user_info.get("budget_max", 3000000)
         status = user_info.get("status_pernikahan", "lajang")
 
-        await self.search_listings(
+        _, source_counts = await self.search_listings(
             location=location,
             budget_min=budget_min,
             budget_max=budget_max,
@@ -304,6 +347,7 @@ class HousingAgent:
                 "messages": [line for line in check_result.splitlines() if line.strip()],
                 "is_product": True,
                 "product": products,
+                "source_counts": source_counts,
             }
             logger.info("[RESPONSE] is_product=True products=%d", len(products))
             return response
@@ -314,6 +358,7 @@ class HousingAgent:
             "messages": [line for line in text_response.splitlines() if line.strip()],
             "is_product": False,
             "product": [],
+            "source_counts": source_counts,
         }
         logger.info("[RESPONSE] is_product=False products=0 (fallback text)")
         return response

@@ -67,29 +67,39 @@ class FacebookMarketplaceScraper(BaseScraper):
 
     def _extract_items(self, data: dict, limit: int) -> list[PropertyListing]:
         results: list[PropertyListing] = []
+        property_keywords = {
+            "kost", "kos", "kontrakan", "rumah", "apartemen", "apartment",
+            "sewa", "kamar", "disewakan", "dijual", "cluster", "perumahan",
+            "ruko", "villa",
+        }
+
+        def _is_property_title(title: str) -> bool:
+            lowered = title.lower()
+            return any(k in lowered for k in property_keywords)
 
         def _walk(obj, depth=0):
             if depth > 10 or len(results) >= limit:
                 return
             if isinstance(obj, dict):
-                if "marketplace_listing_title" in str(obj) or "listing" in str(obj).lower():
-                    for key in obj:
-                        val = obj[key]
-                        if isinstance(val, dict):
-                            title = val.get("marketplace_listing_title", "") or val.get("title", "") or val.get("name", "")
-                            price_str = val.get("listing_price", "") or val.get("price", "")
-                            if title and isinstance(title, str):
-                                price = self._safe_int(str(price_str)) if price_str else 0
-                                results.append(PropertyListing(
-                                    title=str(title)[:100],
-                                    price=price,
-                                    location="",
-                                    property_type="",
-                                    source=self.source_name,
-                                    url="",
-                                    image_url="",
-                                    images=[],
-                                ))
+                title = obj.get("marketplace_listing_title", "") or obj.get("title", "") or obj.get("name", "")
+                if isinstance(title, str) and title.strip() and _is_property_title(title):
+                    price_str = obj.get("listing_price", "") or obj.get("price", "")
+                    price = self._safe_int(str(price_str)) if price_str else 0
+                    url = obj.get("share_url", "") or obj.get("url", "") or obj.get("story_url", "")
+                    image = ""
+                    photos = obj.get("listing_photos", []) or obj.get("photos", [])
+                    if photos and isinstance(photos, list):
+                        image = photos[0].get("uri", "") if isinstance(photos[0], dict) else str(photos[0])
+                    results.append(PropertyListing(
+                        title=str(title).strip()[:100],
+                        price=price,
+                        location="",
+                        property_type="",
+                        source=self.source_name,
+                        url=str(url) if url else "",
+                        image_url=image,
+                        images=[image] if image else [],
+                    ))
                 for key, val in obj.items():
                     _walk(val, depth + 1)
             elif isinstance(obj, list):
@@ -133,10 +143,7 @@ class FacebookAgent:
         listings = await self.scraper.search(
             client, location, budget_min, budget_max, property_type, limit,
         )
-
-        if not listings:
-            listings = self._llm_fallback(location, budget_min, budget_max, property_type, limit)
-
+        # Do not use LLM fallback for Facebook to avoid fake/junk listings
         return listings
 
     async def get_detail(self, client: httpx.AsyncClient, url: str) -> PropertyDetail:
