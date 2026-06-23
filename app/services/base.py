@@ -63,10 +63,30 @@ class BaseScraper(ABC):
         return int(digits) if digits else 0
 
     def _clean_price(self, text: str) -> int:
-        text = text.lower().replace("rp", "").replace(".", "").replace(",", "").strip()
-        digits = re.sub(r"[^\d]", "", text)
-        val = int(digits) if digits else 0
-        if val < 1000:
+        text = str(text).lower().replace("rp", "").strip()
+        # Handle Indonesian price suffixes: M (million), Jt (juta), Miliar, B
+        # Examples: "1,50m /tahun", "2,10jt /bulan", "3.400.000", "500 rb"
+        multiplier = 1
+        if re.search(r'\d[\s,\.]*m(?:\s|/|$)', text) or re.search(r'\d[\s,\.]*jt', text):
+            multiplier = 1_000_000
+        elif re.search(r'\d[\s,\.]*rb', text):
+            multiplier = 1_000
+        elif re.search(r'\d[\s,\.]*miliar', text) or re.search(r'\d[\s,\.]*b\b', text):
+            multiplier = 1_000_000_000
+
+        # Remove suffixes and extract number
+        text = re.sub(r'[a-z/]', "", text)
+        text = text.replace(".", "").replace(",", ".").strip()
+        # Parse as float then convert
+        try:
+            val = float(text)
+        except ValueError:
+            digits = re.sub(r"[^\d]", "", text)
+            val = float(digits) if digits else 0
+
+        val = int(val * multiplier)
+        # If still very small and no multiplier was applied, assume millions
+        if val < 1000 and multiplier == 1:
             val *= 1_000_000
         return val
 

@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from urllib.parse import quote
+from urllib.parse import unquote
 
 import httpx
 from openai import OpenAI
@@ -11,9 +11,47 @@ from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 
 logger = logging.getLogger(__name__)
 
+BASE_URL = "https://www.rumah123.com"
 
-class OLXScraper(BaseScraper):
-    source_name = "OLX"
+# Location slug map for Rumah123 URL patterns
+LOCATION_SLUG_MAP: dict[str, str] = {
+    "gambir": "jakarta-pusat",
+    "jakarta pusat": "jakarta-pusat",
+    "jakarta selatan": "jakarta-selatan",
+    "jakarta barat": "jakarta-barat",
+    "jakarta timur": "jakarta-timur",
+    "jakarta utara": "jakarta-utara",
+    "jakarta": "dki-jakarta",
+    "depok": "depok",
+    "bogor": "bogor",
+    "bekasi": "bekasi",
+    "tangerang": "tangerang",
+    "bandung": "bandung",
+    "yogyakarta": "yogyakarta",
+    "surabaya": "surabaya",
+    "semarang": "semarang",
+}
+
+
+class Rumah123Scraper(BaseScraper):
+    source_name = "Rumah123"
+
+    def _location_slug(self, location: str) -> str:
+        key = location.strip().lower()
+        if key in LOCATION_SLUG_MAP:
+            return LOCATION_SLUG_MAP[key]
+        for k, v in LOCATION_SLUG_MAP.items():
+            if k in key or key in k:
+                return v
+        return location.strip().lower().replace(" ", "-")
+
+    def _decode_srcset_url(self, srcset: str) -> str:
+        """Extract actual image URL from Rumah123 srcset/portal-img pattern."""
+        # Pattern: /portal-img/_next/image/?url=https%3A%2F%2Fpicture.rumah123.com%2F...&w=1200&q=85
+        m = re.search(r'url=([^&]+)', srcset)
+        if m:
+            return unquote(m.group(1))
+        return srcset
 
     async def search(
         self,
@@ -25,46 +63,132 @@ class OLXScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        query = f"{property_type} {location}"
-        encoded_query = quote(query)
-
-        url = (
-            f"https://www.olx.co.id/properti/rumah/q-{encoded_query}/"
-            f"?search%5Bfilter_float_price:from%5D={budget_min}"
-            f"&search%5Bfilter_float_price:to%5D={budget_max}"
-        )
+        slug = self._location_slug(location)
+        # Use /sewa/ for rent, /jual/ for sale
+        search_url = f"{BASE_URL}/sewa/{slug}/rumah/"
+        logger.info("[Rumah123] search URL: %s", search_url)
 
         try:
             resp = await client.get(
-                url,
+                search_url,
                 headers=self._build_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
             )
+            logger.info("[Rumah123] status=%s", resp.status_code)
+
             if resp.status_code != 200:
-                return results
+                # Try /jual/ as fallback
+                search_url = f"{BASE_URL}/jual/{slug}/rumah/"
+                logger.info("[Rumah123] fallback to jual URL: %s", search_url)
+                resp = await client.get(
+                    search_url,
+                    headers=self._build_headers(),
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                )
+                logger.info("[Rumah123] fallback status=%s", resp.status_code)
+                if resp.status_code != 200:
+                    return results
 
             html = resp.text
-            listing_pattern = re.findall(
-                r'<a[^>]*href="(/item/[^"]+)"[^>]*>.*?'
-                r'<h2[^>]*>(.*?)</h2>.*?'
-                r'<span[^>]*class="[^"]*price[^"]*"[^>]*>(.*?)</span>',
-                html,
-                re.DOTALL | re.IGNORECASE,
+
+            # Parse JSON-LD ItemList for structured data
+            ld_blocks = re.findall(
+                r'<script type="application/ld\+json">(.*?)</script>',
+                html, re.DOTALL,
             )
+            jsonld_items: list[dict] = []
+            for block in ld_blocks:
+                try:
+                    data = json.loads(block)
+                    if data.get("@type") == "ItemList":
+                        jsonld_items = data.get("itemListElement", [])
+                        break
+                except json.JSONDecodeError:
+                    continue
 
-            for match in listing_pattern[:limit]:
-                item_url = f"https://www.olx.co.id{match[0]}"
-                title = re.sub(r"<[^>]+>", "", match[1]).strip()
-                price_text = re.sub(r"<[^>]+>", "", match[2]).strip()
-                price = self._clean_price(price_text)
+            logger.info("[Rumah123] JSON-LD items: %d", len(jsonld_items))
 
-                if budget_min <= price <= budget_max or price == 0:
-                    thumbnail = self._extract_thumbnail(html, item_url)
+            # Build a map of url -> jsonld data
+            jsonld_map: dict[str, dict] = {}
+            for item in jsonld_items:
+                acc = item.get("item", item)
+                url = acc.get("url", "")
+                if url:
+                    # Normalize to path only
+                    path = url.replace(BASE_URL, "")
+                    jsonld_map[path] = acc
+
+            # Find all property links in HTML
+            prop_links = re.findall(r'href="(/properti/[^"]+)"', html)
+            # Deduplicate
+            seen = set()
+            unique_links = []
+            for link in prop_links:
+                if link not in seen:
+                    seen.add(link)
+                    unique_links.append(link)
+
+            logger.info("[Rumah123] property links: %d", len(unique_links))
+
+            for link in unique_links[:limit * 3]:
+                item_url = f"{BASE_URL}{link}"
+
+                # Get data from JSON-LD if available
+                jld = jsonld_map.get(link, {})
+                title = jld.get("name", "")
+                addr = jld.get("address", {})
+                item_location = addr.get("addressLocality", "") if addr else ""
+
+                # Image from JSON-LD or srcset
+                thumbnail = ""
+                jld_image = jld.get("image", "")
+                if isinstance(jld_image, list) and jld_image:
+                    thumbnail = jld_image[0]
+                elif isinstance(jld_image, str):
+                    thumbnail = jld_image
+
+                # If no image from JSON-LD, find from srcset near link
+                if not thumbnail:
+                    link_pos = html.find(f'href="{link}"')
+                    nearby = html[max(0, link_pos - 3000):link_pos + 1000]
+                    srcset_match = re.search(
+                        r'srcset="([^"]+)"',
+                        nearby, re.IGNORECASE,
+                    )
+                    if srcset_match:
+                        thumbnail = self._decode_srcset_url(srcset_match.group(1))
+
+                # Price: find near link in HTML
+                if not title:
+                    # Fallback: extract from URL slug
+                    slug_part = link.split("/properti/")[-1].rstrip("/")
+                    # Remove hos/hor ID suffix
+                    slug_part = re.sub(r'-hos\d+$', '', slug_part)
+                    slug_part = re.sub(r'-hor\d+$', '', slug_part)
+                    title = slug_part.replace("-", " ").title()
+
+                # Price: find data-testid="ldp-text-price" before link
+                link_pos = html.find(f'href="{link}"')
+                nearby_before = html[max(0, link_pos - 2000):link_pos]
+                price_match = re.search(
+                    r'data-testid="ldp-text-price"[^>]*>([^<]+)<',
+                    nearby_before, re.IGNORECASE,
+                )
+                price_text = price_match.group(1).strip() if price_match else ""
+                price = self._clean_price(price_text) if price_text else 0
+
+                logger.info(
+                    "[Rumah123] item: title=%s price=%s img=%s",
+                    title[:50], price, bool(thumbnail),
+                )
+
+                if title:
                     results.append(PropertyListing(
-                        title=title or f"{property_type.title()} di {location}",
+                        title=title,
                         price=price,
-                        location=location,
+                        location=item_location or location,
                         property_type=property_type,
                         source=self.source_name,
                         url=item_url,
@@ -72,8 +196,11 @@ class OLXScraper(BaseScraper):
                         images=[thumbnail] if thumbnail else [],
                     ))
 
-        except Exception:
-            pass
+                if len(results) >= limit:
+                    break
+
+        except Exception as e:
+            logger.warning("[Rumah123] search error: %s", e)
 
         return results
 
@@ -93,38 +220,98 @@ class OLXScraper(BaseScraper):
                 return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
             html = resp.text
-            title = re.sub(r"<[^>]+>", "", re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE).group(1)).strip() if re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE) else ""
-            price_text = re.search(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>(.*?)</span>', html, re.DOTALL | re.IGNORECASE)
-            price = self._clean_price(price_text.group(1)) if price_text else 0
-            description_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
-            description = re.sub(r"<[^>]+>", "", description_match.group(1)).strip() if description_match else ""
 
-            base_url = "https://www.olx.co.id"
-            images = self._extract_image_urls(html, base_url, 10)
+            # Parse JSON-LD on detail page
+            ld_blocks = re.findall(
+                r'<script type="application/ld\+json">(.*?)</script>',
+                html, re.DOTALL,
+            )
+            title = ""
+            price = 0
+            location = ""
+            description = ""
+            images: list[str] = []
+
+            for block in ld_blocks:
+                try:
+                    data = json.loads(block)
+                    t = data.get("@type", "")
+                    if t in ("SingleFamilyResidence", "House", "Apartment", "Residence"):
+                        title = data.get("name", "")
+                        addr = data.get("address", {})
+                        location = addr.get("addressLocality", "") if addr else ""
+                        img = data.get("image", [])
+                        if isinstance(img, list):
+                            images = img[:10]
+                        elif isinstance(img, str):
+                            images = [img]
+                        offers = data.get("offers", {})
+                        if offers:
+                            price = self._clean_price(offers.get("price", ""))
+                        desc = data.get("description", "")
+                        if desc:
+                            description = desc
+                except json.JSONDecodeError:
+                    continue
+
+            # Fallback: HTML parsing
+            if not title:
+                h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE)
+                title = re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else ""
+
+            if price == 0:
+                price_match = re.search(
+                    r'Rp\s*([\d.,]+\s*(?:Juta|Miliar|jt|M)?(?:\s*/\s*(?:tahun|bulan))?)',
+                    html, re.IGNORECASE,
+                )
+                price = self._clean_price(price_match.group()) if price_match else 0
+
+            if not description:
+                desc_match = re.search(
+                    r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>',
+                    html, re.DOTALL | re.IGNORECASE,
+                )
+                description = re.sub(r"<[^>]+>", " ", desc_match.group(1)).strip() if desc_match else ""
+
+            # Images from srcset
+            if not images:
+                srcset_matches = re.findall(r'srcset="([^"]+)"', html, re.IGNORECASE)
+                for ss in srcset_matches:
+                    img_url = self._decode_srcset_url(ss)
+                    if "picture.rumah123.com" in img_url and img_url not in images:
+                        images.append(img_url)
+                    if len(images) >= 10:
+                        break
+
+            logger.info("[Rumah123] detail: title=%s price=%s images=%d", title, price, len(images))
 
             return PropertyDetail(
                 title=title,
                 price=price,
-                location="",
+                location=location,
                 description=description,
-                images=images,
+                images=images[:10],
                 source=self.source_name,
                 url=url,
             )
         except Exception as e:
-            logger.warning("OLX detail failed: %s", e)
+            logger.warning("Rumah123 detail failed: %s", e)
             return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
 
+# Keep old names for backward compatibility
+OLXScraper = Rumah123Scraper
+
+
 class OLXAgent:
-    source_name = "OLX"
+    source_name = "Rumah123"
 
     def __init__(self):
         self.llm = OpenAI(
             api_key=settings.API_KEY,
             base_url=settings.LLM_URL,
         )
-        self.scraper = OLXScraper()
+        self.scraper = Rumah123Scraper()
 
     async def search_and_analyze(
         self,
@@ -174,7 +361,7 @@ class OLXAgent:
             )
             text = response.choices[0].message.content.strip()
         except Exception as e:
-            logger.warning("OLX LLM fallback failed: %s", e)
+            logger.warning("Rumah123 LLM fallback failed: %s", e)
             return []
 
         listings: list[PropertyListing] = []

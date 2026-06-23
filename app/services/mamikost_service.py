@@ -1,6 +1,6 @@
+import json
 import logging
 import re
-from urllib.parse import quote
 
 import httpx
 from openai import OpenAI
@@ -11,48 +11,11 @@ from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://mamikos.com"
-
-# Pre-built slug map for common Jakarta areas
-LOCATION_SLUG_MAP: dict[str, str] = {
-    "gambir": "gambir-kota-jakarta-pusat-daerah-khusus-ibukota-jakarta-indonesia",
-    "jakarta pusat": "kota-jakarta-pusat-daerah-khusus-ibukota-jakarta-indonesia",
-    "jakarta selatan": "kota-jakarta-selatan-daerah-khusus-ibukota-jakarta-indonesia",
-    "jakarta barat": "kota-jakarta-barat-daerah-khusus-ibukota-jakarta-indonesia",
-    "jakarta timur": "kota-jakarta-timur-daerah-khusus-ibukota-jakarta-indonesia",
-    "jakarta utara": "kota-jakarta-utara-daerah-khusus-ibukota-jakarta-indonesia",
-    "depok": "kota-depok-jawa-barat-indonesia",
-    "bogor": "kota-bogor-jawa-barat-indonesia",
-    "bekasi": "kota-bekasi-jawa-barat-indonesia",
-    "tangerang": "kota-tangerang-banten-indonesia",
-    "bandung": "kota-bandung-jawa-barat-indonesia",
-    "yogyakarta": "kota-yogyakarta-daerah-istimewa-yogyakarta-indonesia",
-    "surabaya": "kota-surabaya-jawa-timur-indonesia",
-    "semarang": "kota-semarang-jawa-tengah-indonesia",
-}
+API_URL = f"{BASE_URL}/api/v1/stories/list"
 
 
 class MamikostScraper(BaseScraper):
     source_name = "Mamikost"
-
-    def _location_slug(self, location: str) -> str:
-        key = location.strip().lower()
-        if key in LOCATION_SLUG_MAP:
-            return LOCATION_SLUG_MAP[key]
-        # Check partial match
-        for k, v in LOCATION_SLUG_MAP.items():
-            if k in key or key in k:
-                return v
-        # Fallback: lower + spaces to hyphens
-        return key.replace(" ", "-")
-
-    def _build_search_url(self, location: str, budget_min: int, budget_max: int) -> str:
-        slug = self._location_slug(location)
-        price_to = budget_max + 1000
-        return (
-            f"{BASE_URL}/cari/{slug}/all/bulanan/0-{price_to}/1"
-            f"?keyword={quote(location)}&suggestion_type=search&rent=2"
-            f"&sort=price,-&price=0-{price_to}&singgahsini=0"
-        )
 
     async def search(
         self,
@@ -64,100 +27,70 @@ class MamikostScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        url = self._build_search_url(location, budget_min, budget_max)
-        logger.info("[Mamikost] search URL: %s", url)
+
+        body = {
+            "take": limit * 3,
+            "page": 1,
+            "keywords": location,
+            "filters": {
+                "keywords": location,
+                "rent_type": 2,
+                "price_range": [budget_min, budget_max],
+                "sorting": "price",
+                "sorting_direction": "-",
+            },
+        }
+
+        headers = self._build_headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        headers["Referer"] = f"{BASE_URL}/"
+
+        logger.info("[Mamikost] API POST: %s", API_URL)
 
         try:
-            resp = await client.get(
-                url,
-                headers=self._build_headers(),
+            resp = await client.post(
+                API_URL,
+                headers=headers,
+                json=body,
                 timeout=self.timeout,
                 follow_redirects=True,
             )
-            logger.info("[Mamikost] status=%s", resp.status_code)
+            logger.info("[Mamikost] API status=%s", resp.status_code)
+
             if resp.status_code != 200:
                 return results
 
-            html = resp.text
+            data = resp.json()
+            rooms = data.get("rooms", [])
+            logger.info("[Mamikost] API rooms: %d", len(rooms))
 
-            # Extract card blocks: <div ... class="kost-rc" ...>
-            # Each card contains a room link, name and price
-            card_blocks = re.findall(
-                r'<div[^>]*class="[^"]*kost-rc[^"]*"[^>]*>(.*?)</div>\s*</div>',
-                html,
-                re.DOTALL | re.IGNORECASE,
-            )
-            logger.info("[Mamikost] card_blocks found: %d", len(card_blocks))
+            for room in rooms:
+                title = room.get("room-title", "") or room.get("area_label", "")
+                share_url = room.get("share_url", "")
+                item_url = share_url if share_url else ""
 
-            if not card_blocks:
-                # Fallback: look for room hrefs with nearby price
-                card_blocks_raw = re.findall(
-                    r'(<a[^>]*href="(/room/[^"?]+)[^"]*"[^>]*>.*?</a>)',
-                    html,
-                    re.DOTALL | re.IGNORECASE,
-                )
-                logger.info("[Mamikost] fallback room anchors: %d", len(card_blocks_raw))
-                for raw_anchor, path in card_blocks_raw[:limit * 2]:
-                    item_url = f"{BASE_URL}{path}"
-                    title_match = re.search(r'<(?:h[1-6]|p|span|div)[^>]*>([^<]{5,})</(?:h[1-6]|p|span|div)>', raw_anchor, re.IGNORECASE)
-                    title = re.sub(r"<[^>]+>", "", title_match.group(1)).strip() if title_match else ""
-                    price_match = re.search(r'Rp\s*([\d.,]+)', raw_anchor, re.IGNORECASE)
-                    price = self._clean_price(price_match.group(1)) if price_match else 0
-                    img_match = re.search(r'<img[^>]+(?:src|data-src)="(https?://[^"]+)"[^>]*>', raw_anchor, re.IGNORECASE)
-                    thumbnail = img_match.group(1) if img_match else ""
-                    if title and (budget_min <= price <= budget_max or price == 0):
-                        results.append(PropertyListing(
-                            title=title,
-                            price=price,
-                            location=location,
-                            property_type="kost",
-                            source=self.source_name,
-                            url=item_url,
-                            image_url=thumbnail,
-                            images=[thumbnail] if thumbnail else [],
-                        ))
-                        if len(results) >= limit:
-                            break
-                return results
+                price_fmt = room.get("price_title_format", {})
+                price_str = price_fmt.get("price", "")
+                price = self._clean_price(price_str) if price_str else 0
 
-            for block in card_blocks[:limit]:
-                # Room URL
-                url_match = re.search(r'href="(/room/[^"?]+)', block, re.IGNORECASE)
-                if not url_match:
-                    url_match = re.search(r'href="(https?://mamikos\.com/room/[^"?]+)', block, re.IGNORECASE)
-                if not url_match:
-                    continue
-                path = url_match.group(1)
-                item_url = path if path.startswith("http") else f"{BASE_URL}{path}"
+                photo = room.get("photo_url", {})
+                thumbnail = photo.get("medium", photo.get("large", photo.get("small", "")))
 
-                # Title
-                title_match = re.search(r'<(?:h[1-6]|p|span)[^>]*class="[^"]*(?:name|title|kost-name)[^"]*"[^>]*>(.*?)</(?:h[1-6]|p|span)>', block, re.DOTALL | re.IGNORECASE)
-                if not title_match:
-                    title_match = re.search(r'<(?:h[1-6])[^>]*>(.*?)</(?:h[1-6])>', block, re.DOTALL | re.IGNORECASE)
-                title = re.sub(r"<[^>]+>", "", title_match.group(1)).strip() if title_match else ""
-
-                # Price
-                price_match = re.search(r'Rp\s*([\d.,]+)', block, re.IGNORECASE)
-                price = self._clean_price(price_match.group(1)) if price_match else 0
-
-                # Thumbnail
-                img_match = re.search(
-                    r'<img[^>]+(?:src|data-src|data-lazy-src)="(https?://[^"]+)"[^>]*>',
-                    block,
-                    re.IGNORECASE,
-                )
-                thumbnail = img_match.group(1) if img_match else ""
+                subdistrict = room.get("subdistrict", "")
+                city = room.get("city", "")
+                item_location = f"{subdistrict}, {city}".strip(", ")
 
                 logger.info(
-                    "[Mamikost] card: title=%s price=%s url=%s image=%s",
-                    title, price, item_url, thumbnail,
+                    "[Mamikost] room: title=%s price=%s img=%s loc=%s",
+                    title[:40], price, bool(thumbnail), item_location[:30],
                 )
 
-                if budget_min <= price <= budget_max or price == 0:
+                if title and (budget_min <= price <= budget_max or price == 0):
                     results.append(PropertyListing(
-                        title=title or f"Kost di {location}",
+                        title=title,
                         price=price,
-                        location=location,
+                        location=item_location or location,
                         property_type="kost",
                         source=self.source_name,
                         url=item_url,
@@ -165,8 +98,11 @@ class MamikostScraper(BaseScraper):
                         images=[thumbnail] if thumbnail else [],
                     ))
 
+                if len(results) >= limit:
+                    break
+
         except Exception as e:
-            logger.warning("[Mamikost] search error: %s", e)
+            logger.warning("[Mamikost] API error: %s", e)
 
         return results
 
@@ -175,6 +111,72 @@ class MamikostScraper(BaseScraper):
         client: httpx.AsyncClient,
         url: str,
     ) -> PropertyDetail:
+        slug_match = re.search(r'/room/([^?]+)', url)
+        slug = slug_match.group(1) if slug_match else ""
+
+        if slug:
+            detail_api = f"{BASE_URL}/api/v1/stories/detail/{slug}"
+            headers = self._build_headers()
+            headers["Accept"] = "application/json"
+            headers["Referer"] = f"{BASE_URL}/"
+
+            try:
+                resp = await client.get(
+                    detail_api,
+                    headers=headers,
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                )
+                logger.info("[Mamikost] detail API status=%s", resp.status_code)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    room = data.get("room", data.get("data", {}))
+                    if room:
+                        title = room.get("room-title", room.get("name", ""))
+                        price_fmt = room.get("price_title_format", {})
+                        price = self._clean_price(price_fmt.get("price", "")) if price_fmt else 0
+                        description = room.get("description", room.get("remark", ""))
+                        subdistrict = room.get("subdistrict", "")
+                        city = room.get("city", "")
+                        location = f"{subdistrict}, {city}".strip(", ")
+
+                        images = []
+                        cards = room.get("cards", [])
+                        for card in cards:
+                            if isinstance(card, dict):
+                                for key in ("photo_url", "url", "image"):
+                                    img = card.get(key, "")
+                                    if img and isinstance(img, str) and "static.mamikos.com" in img:
+                                        images.append(img)
+                                    elif isinstance(img, dict):
+                                        for sz in ("large", "medium", "small"):
+                                            if img.get(sz):
+                                                images.append(img[sz])
+                                                break
+
+                        if not images:
+                            photo = room.get("photo_url", {})
+                            if photo:
+                                for sz in ("large", "medium", "small"):
+                                    if photo.get(sz):
+                                        images.append(photo[sz])
+                                        break
+
+                        logger.info("[Mamikost] detail: title=%s price=%s images=%d", title, price, len(images))
+
+                        return PropertyDetail(
+                            title=title,
+                            price=price,
+                            location=location,
+                            description=description,
+                            images=images[:10],
+                            source=self.source_name,
+                            url=url,
+                        )
+            except Exception as e:
+                logger.warning("[Mamikost] detail API error: %s", e)
+
         try:
             resp = await client.get(
                 url,
@@ -193,14 +195,12 @@ class MamikostScraper(BaseScraper):
             price_text = re.search(r'Rp\s*([\d.,]+)', html, re.IGNORECASE)
             price = self._clean_price(price_text.group(1)) if price_text else 0
 
-            # Description: try multiple class patterns
             desc_match = re.search(
                 r'<(?:div|p)[^>]*class="[^"]*(?:desc|description|kost-desc|room-desc)[^"]*"[^>]*>(.*?)</(?:div|p)>',
                 html, re.DOTALL | re.IGNORECASE
             )
             description = re.sub(r"<[^>]+>", " ", desc_match.group(1)).strip() if desc_match else ""
 
-            # Images: prefer data-src (lazy loaded)
             images = []
             for pattern in [
                 r'<img[^>]+data-src="(https?://[^"]+)"',
@@ -214,7 +214,7 @@ class MamikostScraper(BaseScraper):
                 if len(images) >= 10:
                     break
 
-            logger.info("[Mamikost] detail: title=%s price=%s images=%d", title, price, len(images))
+            logger.info("[Mamikost] detail HTML: title=%s price=%s images=%d", title, price, len(images))
 
             return PropertyDetail(
                 title=title,

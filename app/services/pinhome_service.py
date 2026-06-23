@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from urllib.parse import quote
@@ -9,6 +10,8 @@ from app.core.config import settings
 from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 
 logger = logging.getLogger(__name__)
+
+BASE_URL = "https://www.pinhome.id"
 
 
 class PinhomeScraper(BaseScraper):
@@ -24,49 +27,95 @@ class PinhomeScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        encoded_location = quote(location)
-        tipe = "sewa" if property_type in ("kost", "kontrakan") else "jual"
-        url = f"https://www.pinhome.id/{tipe}/rumah/{encoded_location}"
+        # Pinhome has a dedicated /kost/ page with JSON-LD data
+        search_url = f"{BASE_URL}/kost/"
+        if property_type == "kontrakan":
+            search_url = f"{BASE_URL}/sewa/rumah"
+
+        logger.info("[Pinhome] search URL: %s", search_url)
 
         try:
             resp = await client.get(
-                url,
+                search_url,
                 headers=self._build_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
             )
+            logger.info("[Pinhome] status=%s", resp.status_code)
             if resp.status_code != 200:
                 return results
 
             html = resp.text
-            cards = re.findall(
-                r'<a[^>]*href="(/properti/[^"]+)"[^>]*>.*?'
-                r'<h[23][^>]*>(.*?)</h[23]>.*?'
-                r'Rp\s*([\d.,]+)',
-                html,
-                re.DOTALL | re.IGNORECASE,
+
+            # Parse JSON-LD ItemList
+            ld_blocks = re.findall(
+                r'<script type="application/ld\+json">(.*?)</script>',
+                html, re.DOTALL,
             )
+            logger.info("[Pinhome] JSON-LD blocks: %d", len(ld_blocks))
 
-            for match in cards[:limit]:
-                item_url = f"https://www.pinhome.id{match[0]}"
-                title = re.sub(r"<[^>]+>", "", match[1]).strip()
-                price = self._clean_price(match[2])
+            items = []
+            for block in ld_blocks:
+                try:
+                    data = json.loads(block)
+                    if isinstance(data, dict) and data.get("@type") == "ItemList":
+                        items = data.get("itemListElement", [])
+                        break
+                except json.JSONDecodeError:
+                    continue
 
-                if budget_min <= price <= budget_max or price == 0:
-                    thumbnail = self._extract_thumbnail(html, item_url)
+            logger.info("[Pinhome] items from JSON-LD: %d", len(items))
+
+            for item in items:
+                acc = item.get("item", {})
+                name = acc.get("name", "")
+                item_url = acc.get("url", "")
+                if item_url:
+                    # Fix double slash after domain
+                    item_url = item_url.replace("https://www.pinhome.id//", f"{BASE_URL}/")
+                    if not item_url.startswith("http"):
+                        item_url = BASE_URL + item_url
+                else:
+                    item_url = ""
+
+                image = acc.get("image", "")
+                offers = acc.get("offers", {})
+                price = int(offers.get("price", 0)) if offers.get("price") else 0
+                addr = acc.get("address", {})
+                addr_locality = addr.get("addressLocality", "")
+                addr_region = addr.get("addressRegion", "")
+                item_location = f"{addr_locality}, {addr_region}".strip(", ")
+
+                # Filter by location keyword and budget
+                loc_match = (
+                    location.lower() in name.lower()
+                    or location.lower() in item_location.lower()
+                    or not location
+                )
+                budget_ok = (budget_min <= price <= budget_max) if price else True
+
+                logger.info(
+                    "[Pinhome] item: name=%s price=%s loc=%s img=%s match=%s",
+                    name[:50], price, item_location[:30], bool(image), loc_match and budget_ok,
+                )
+
+                if loc_match and budget_ok:
                     results.append(PropertyListing(
-                        title=title or f"{tipe.title()} di {location}",
+                        title=name or f"Kost di {location}",
                         price=price,
-                        location=location,
+                        location=item_location or location,
                         property_type=property_type,
                         source=self.source_name,
                         url=item_url,
-                        image_url=thumbnail,
-                        images=[thumbnail] if thumbnail else [],
+                        image_url=image,
+                        images=[image] if image else [],
                     ))
 
-        except Exception:
-            pass
+                if len(results) >= limit:
+                    break
+
+        except Exception as e:
+            logger.warning("[Pinhome] search error: %s", e)
 
         return results
 
@@ -86,14 +135,41 @@ class PinhomeScraper(BaseScraper):
                 return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
             html = resp.text
-            title = re.sub(r"<[^>]+>", "", re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE).group(1)).strip() if re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE) else ""
+
+            # Try JSON-LD first
+            ld_blocks = re.findall(
+                r'<script type="application/ld\+json">(.*?)</script>',
+                html, re.DOTALL,
+            )
+            for block in ld_blocks:
+                try:
+                    data = json.loads(block)
+                    if isinstance(data, dict) and data.get("@type") in ("Accommodation", "Residence", "Place"):
+                        return PropertyDetail(
+                            title=data.get("name", ""),
+                            price=int(data.get("offers", {}).get("price", 0)) if data.get("offers") else 0,
+                            location=data.get("address", {}).get("addressLocality", ""),
+                            description=data.get("description", ""),
+                            images=[data.get("image", "")] if data.get("image") else [],
+                            source=self.source_name,
+                            url=url,
+                        )
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+            # Fallback to HTML parsing
+            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE)
+            title = re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else ""
+
             price_text = re.search(r'Rp\s*([\d.,]+)', html, re.IGNORECASE)
             price = self._clean_price(price_text.group(1)) if price_text else 0
-            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
-            description = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip() if desc_match else ""
 
-            base_url = "https://www.pinhome.id"
-            images = self._extract_image_urls(html, base_url, 10)
+            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
+            description = re.sub(r"<[^>]+>", " ", desc_match.group(1)).strip() if desc_match else ""
+
+            images = self._extract_image_urls(html, BASE_URL, 10)
+
+            logger.info("[Pinhome] detail: title=%s price=%s images=%d", title, price, len(images))
 
             return PropertyDetail(
                 title=title,

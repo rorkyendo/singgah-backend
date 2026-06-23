@@ -10,9 +10,38 @@ from app.services.base import BaseScraper, PropertyListing, PropertyDetail
 
 logger = logging.getLogger(__name__)
 
+BASE_URL = "https://www.lamudi.co.id"
+
+# Lamudi location slug map
+LAMUDI_LOCATION_MAP: dict[str, str] = {
+    "gambir": "jakarta/jakarta-pusat",
+    "jakarta pusat": "jakarta/jakarta-pusat",
+    "jakarta selatan": "jakarta/jakarta-selatan",
+    "jakarta barat": "jakarta/jakarta-barat",
+    "jakarta timur": "jakarta/jakarta-timur",
+    "jakarta utara": "jakarta/jakarta-utara",
+    "depok": "jawa-barat/depok",
+    "bogor": "jawa-barat/kota-bogor",
+    "bekasi": "jawa-barat/kota-bekasi",
+    "tangerang": "banten/kota-tangerang",
+    "bandung": "jawa-barat/kota-bandung",
+    "yogyakarta": "di-yogyakarta/kota-yogyakarta",
+    "surabaya": "jawa-timur/kota-surabaya",
+    "semarang": "jawa-tengah/kota-semarang",
+}
+
 
 class LamudiScraper(BaseScraper):
     source_name = "Lamudi"
+
+    def _location_slug(self, location: str) -> str:
+        key = location.strip().lower()
+        if key in LAMUDI_LOCATION_MAP:
+            return LAMUDI_LOCATION_MAP[key]
+        for k, v in LAMUDI_LOCATION_MAP.items():
+            if k in key or key in k:
+                return v
+        return key.replace(" ", "-")
 
     async def search(
         self,
@@ -24,45 +53,90 @@ class LamudiScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        encoded_query = quote(f"{property_type} {location}")
-        url = (
-            f"https://www.lamudi.co.id/search/"
-            f"?q={encoded_query}"
-            f"&type=rent"
-            f"&price_min={budget_min}"
-            f"&price_max={budget_max}"
-        )
+        slug = self._location_slug(location)
+        # Lamudi URL: /sewa/{region}/{city}/rumah/
+        search_url = f"{BASE_URL}/sewa/{slug}/rumah/"
+        logger.info("[Lamudi] search URL: %s", search_url)
 
         try:
             resp = await client.get(
-                url,
+                search_url,
                 headers=self._build_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
             )
+            logger.info("[Lamudi] status=%s", resp.status_code)
             if resp.status_code != 200:
                 return results
 
             html = resp.text
-            cards = re.findall(
-                r'<a[^>]*href="(/property/[^"]+)"[^>]*>.*?'
-                r'<h[23][^>]*>(.*?)</h[23]>.*?'
-                r'Rp\s*([\d.,]+)',
-                html,
-                re.DOTALL | re.IGNORECASE,
-            )
 
-            for match in cards[:limit]:
-                item_url = f"https://www.lamudi.co.id{match[0]}"
-                title = re.sub(r"<[^>]+>", "", match[1]).strip()
-                price = self._clean_price(match[2])
+            # Find all normal-listing card blocks
+            # Each card starts with data-test="normal-listing"
+            card_chunks = re.split(r'data-test="normal-listing"', html)
+            # First chunk is before the first card, skip it
+            card_chunks = card_chunks[1:]
+            logger.info("[Lamudi] card chunks: %d", len(card_chunks))
 
-                if budget_min <= price <= budget_max or price == 0:
-                    thumbnail = self._extract_thumbnail(html, item_url)
+            for chunk in card_chunks[:limit * 3]:
+                # Only take first 5000 chars of each card to avoid overlap
+                card = chunk[:5000]
+
+                # URL: href="/properti/..." or href="/sewa/..."
+                href_match = re.search(r'href="(/properti/[^"]+|/sewa/[^"]+/)"', card)
+                if not href_match:
+                    continue
+                item_url = f"{BASE_URL}{href_match.group(1)}"
+
+                # Title: snippet__content__title with content attribute
+                title_match = re.search(
+                    r'class="snippet__content__title"[^>]*content="([^"]+)"',
+                    card,
+                )
+                if not title_match:
+                    title_match = re.search(
+                        r'class="snippet__content__title"[^>]*>([^<]+)<',
+                        card,
+                    )
+                title = title_match.group(1).strip() if title_match else ""
+
+                # Location: data-test="snippet-content-location"
+                loc_match = re.search(
+                    r'data-test="snippet-content-location">([^<]+)<',
+                    card,
+                )
+                item_location = loc_match.group(1).strip() if loc_match else location
+
+                # Price: snippet__content__price - capture full text including M/Jt suffix
+                price_match = re.search(
+                    r'class="snippet__content__price"[^>]*>(.*?)</div>',
+                    card, re.DOTALL | re.IGNORECASE,
+                )
+                if price_match:
+                    price_text = re.sub(r"<[^>]+>", "", price_match.group(1)).strip()
+                else:
+                    price_fallback = re.search(r'Rp[\.\s\d,]+\s*(?:M|Jt|Rb|Miliar)?(?:\s*/\s*(?:bulan|tahun|malam))?', card, re.IGNORECASE)
+                    price_text = price_fallback.group().strip() if price_fallback else ""
+                price = self._clean_price(price_text) if price_text else 0
+
+                # Image: first <img> with lamudi URL inside snippet__image
+                img_match = re.search(
+                    r'<img[^>]+src="(https://img\.lamudi\.com[^"]+)"',
+                    card,
+                    re.IGNORECASE,
+                )
+                thumbnail = img_match.group(1) if img_match else ""
+
+                logger.info(
+                    "[Lamudi] card: title=%s price=%s loc=%s img=%s",
+                    title[:40], price, item_location[:30], bool(thumbnail),
+                )
+
+                if title and (budget_min <= price <= budget_max or price == 0):
                     results.append(PropertyListing(
-                        title=title or f"{property_type.title()} di {location}",
+                        title=title,
                         price=price,
-                        location=location,
+                        location=item_location,
                         property_type=property_type,
                         source=self.source_name,
                         url=item_url,
@@ -70,8 +144,11 @@ class LamudiScraper(BaseScraper):
                         images=[thumbnail] if thumbnail else [],
                     ))
 
-        except Exception:
-            pass
+                if len(results) >= limit:
+                    break
+
+        except Exception as e:
+            logger.warning("[Lamudi] search error: %s", e)
 
         return results
 
@@ -91,21 +168,50 @@ class LamudiScraper(BaseScraper):
                 return PropertyDetail(title="", price=0, location="", description="", url=url, source=self.source_name)
 
             html = resp.text
-            title = re.sub(r"<[^>]+>", "", re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE).group(1)).strip() if re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE) else ""
-            price_text = re.search(r'Rp\s*([\d.,]+)', html, re.IGNORECASE)
-            price = self._clean_price(price_text.group(1)) if price_text else 0
-            desc_match = re.search(r'<div[^>]*class="[^"]*description[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
-            description = re.sub(r"<[^>]+>", "", desc_match.group(1)).strip() if desc_match else ""
 
-            base_url = "https://www.lamudi.co.id"
-            images = self._extract_image_urls(html, base_url, 10)
+            # Title
+            h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL | re.IGNORECASE)
+            title = re.sub(r"<[^>]+>", "", h1.group(1)).strip() if h1 else ""
+
+            # Price
+            price_match = re.search(r'Rp[\.\s\d,]+(?:\s*/\s*(?:bulan|tahun|malam))?', html, re.IGNORECASE)
+            price = self._clean_price(price_match.group()) if price_match else 0
+
+            # Description - try multiple patterns
+            desc_match = re.search(
+                r'class="[^"]*(?:description|desc-content|body-content)[^"]*"[^>]*>(.*?)</div>',
+                html, re.DOTALL | re.IGNORECASE,
+            )
+            description = re.sub(r"<[^>]+>", " ", desc_match.group(1)).strip() if desc_match else ""
+
+            # Location
+            loc_match = re.search(
+                r'data-test="[^"]*location[^"]*">([^<]+)<',
+                html, re.IGNORECASE,
+            )
+            location = loc_match.group(1).strip() if loc_match else ""
+
+            # Images
+            images = []
+            for pattern in [
+                r'<img[^>]+src="(https://img\.lamudi\.com[^"]+)"',
+                r'<img[^>]+data-src="(https://img\.lamudi\.com[^"]+)"',
+            ]:
+                found = re.findall(pattern, html, re.IGNORECASE)
+                for src in found:
+                    if src not in images and "svg" not in src.lower() and "logo" not in src.lower():
+                        images.append(src)
+                if len(images) >= 10:
+                    break
+
+            logger.info("[Lamudi] detail: title=%s price=%s images=%d", title, price, len(images))
 
             return PropertyDetail(
                 title=title,
                 price=price,
-                location="",
+                location=location,
                 description=description,
-                images=images,
+                images=images[:10],
                 source=self.source_name,
                 url=url,
             )
