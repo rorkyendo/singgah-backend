@@ -12,36 +12,20 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.lamudi.co.id"
 
-# Lamudi location slug map: province/city
-LAMUDI_LOCATION_MAP: dict[str, str] = {
-    "gambir": "jakarta/jakarta-pusat",
-    "jakarta pusat": "jakarta/jakarta-pusat",
-    "jakarta selatan": "jakarta/jakarta-selatan",
-    "jakarta barat": "jakarta/jakarta-barat",
-    "jakarta timur": "jakarta/jakarta-timur",
-    "jakarta utara": "jakarta/jakarta-utara",
-    "depok": "jawa-barat/depok",
-    "bogor": "jawa-barat/bogor",
-    "bekasi": "jawa-barat/bekasi",
-    "tangerang": "banten/tangerang",
-    "bandung": "jawa-barat/bandung",
-    "yogyakarta": "yogyakarta",
-    "surabaya": "jawa-timur/surabaya",
-    "semarang": "jawa-tengah/semarang",
-}
-
-
 class LamudiScraper(BaseScraper):
     source_name = "Lamudi"
 
     def _location_slug(self, location: str) -> str:
-        key = location.strip().lower()
-        if key in LAMUDI_LOCATION_MAP:
-            return LAMUDI_LOCATION_MAP[key]
-        for k, v in LAMUDI_LOCATION_MAP.items():
-            if k in key or key in k:
-                return v
-        return key.replace(" ", "-")
+        return location.strip().lower().replace(" ", "-")
+
+    def _location_candidates(self, location: str) -> list[str]:
+        """Return candidate slugs for a location.
+
+        Lamudi redirects single-segment city slugs to province/city automatically,
+        so the direct slug is usually sufficient.
+        """
+        slug = self._location_slug(location)
+        return [slug]
 
     def _category_path(self, property_type: str) -> str:
         """Map property_type to Lamudi URL category."""
@@ -63,103 +47,108 @@ class LamudiScraper(BaseScraper):
         limit: int = 5,
     ) -> list[PropertyListing]:
         results: list[PropertyListing] = []
-        slug = self._location_slug(location)
+        candidates = self._location_candidates(location)
         category = self._category_path(property_type)
-        # Lamudi URL: /sewa/{region}/{city}/{category}/
-        search_url = f"{BASE_URL}/sewa/{slug}/{category}/"
-        logger.info("[Lamudi] search URL: %s", search_url)
+        resp = None
 
-        try:
-            resp = await client.get(
-                search_url,
-                headers=self._build_headers(),
-                timeout=self.timeout,
-                follow_redirects=True,
+        for slug in candidates:
+            # Lamudi URL: /sewa/{region}/{city}/{category}/
+            search_url = f"{BASE_URL}/sewa/{slug}/{category}/"
+            logger.info("[Lamudi] search URL: %s", search_url)
+            try:
+                resp = await client.get(
+                    search_url,
+                    headers=self._build_headers(),
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                )
+                logger.info("[Lamudi] status=%s", resp.status_code)
+            except Exception as e:
+                logger.warning("[Lamudi] request error: %s", e)
+                continue
+            if resp.status_code == 200:
+                break
+
+        if not resp or resp.status_code != 200:
+            return results
+
+        html = resp.text
+
+        # Find all normal-listing card blocks
+        # Each card starts with data-test="normal-listing"
+        card_chunks = re.split(r'data-test="normal-listing"', html)
+        # First chunk is before the first card, skip it
+        card_chunks = card_chunks[1:]
+        logger.info("[Lamudi] card chunks: %d", len(card_chunks))
+
+        for chunk in card_chunks[:limit * 3]:
+            # Only take first 5000 chars of each card to avoid overlap
+            card = chunk[:5000]
+
+            # URL: href="/properti/..." or href="/sewa/..."
+            href_match = re.search(r'href="(/properti/[^"]+|/sewa/[^"]+/)"', card)
+            if not href_match:
+                continue
+            item_url = f"{BASE_URL}{href_match.group(1)}"
+
+            # Title: snippet__content__title with content attribute
+            title_match = re.search(
+                r'class="snippet__content__title"[^>]*content="([^"]+)"',
+                card,
             )
-            logger.info("[Lamudi] status=%s", resp.status_code)
-            if resp.status_code != 200:
-                return results
-
-            html = resp.text
-
-            # Find all normal-listing card blocks
-            # Each card starts with data-test="normal-listing"
-            card_chunks = re.split(r'data-test="normal-listing"', html)
-            # First chunk is before the first card, skip it
-            card_chunks = card_chunks[1:]
-            logger.info("[Lamudi] card chunks: %d", len(card_chunks))
-
-            for chunk in card_chunks[:limit * 3]:
-                # Only take first 5000 chars of each card to avoid overlap
-                card = chunk[:5000]
-
-                # URL: href="/properti/..." or href="/sewa/..."
-                href_match = re.search(r'href="(/properti/[^"]+|/sewa/[^"]+/)"', card)
-                if not href_match:
-                    continue
-                item_url = f"{BASE_URL}{href_match.group(1)}"
-
-                # Title: snippet__content__title with content attribute
+            if not title_match:
                 title_match = re.search(
-                    r'class="snippet__content__title"[^>]*content="([^"]+)"',
+                    r'class="snippet__content__title"[^>]*>([^<]+)<',
                     card,
                 )
-                if not title_match:
-                    title_match = re.search(
-                        r'class="snippet__content__title"[^>]*>([^<]+)<',
-                        card,
-                    )
-                title = title_match.group(1).strip() if title_match else ""
+            title = title_match.group(1).strip() if title_match else ""
 
-                # Location: data-test="snippet-content-location"
-                loc_match = re.search(
-                    r'data-test="snippet-content-location">([^<]+)<',
-                    card,
-                )
-                item_location = loc_match.group(1).strip() if loc_match else location
+            # Location: data-test="snippet-content-location"
+            loc_match = re.search(
+                r'data-test="snippet-content-location">([^<]+)<',
+                card,
+            )
+            item_location = loc_match.group(1).strip() if loc_match else location
 
-                # Price: snippet__content__price - capture full text including M/Jt suffix
-                price_match = re.search(
-                    r'class="snippet__content__price"[^>]*>(.*?)</div>',
-                    card, re.DOTALL | re.IGNORECASE,
-                )
-                if price_match:
-                    price_text = re.sub(r"<[^>]+>", "", price_match.group(1)).strip()
-                else:
-                    price_fallback = re.search(r'Rp[\.\s\d,]+\s*(?:M|Jt|Rb|Miliar)?(?:\s*/\s*(?:bulan|tahun|malam))?', card, re.IGNORECASE)
-                    price_text = price_fallback.group().strip() if price_fallback else ""
-                price = self._clean_price(price_text) if price_text else 0
+            # Price: snippet__content__price - capture full text including M/Jt suffix
+            price_match = re.search(
+                r'class="snippet__content__price"[^>]*>(.*?)</div>',
+                card, re.DOTALL | re.IGNORECASE,
+            )
+            if price_match:
+                price_text = re.sub(r"<[^>]+>", "", price_match.group(1)).strip()
+            else:
+                price_fallback = re.search(r'Rp[\.\s\d,]+\s*(?:M|Jt|Rb|Miliar)?(?:\s*/\s*(?:bulan|tahun|malam))?', card, re.IGNORECASE)
+                price_text = price_fallback.group().strip() if price_fallback else ""
+            price = self._clean_price(price_text) if price_text else 0
 
-                # Image: first <img> with lamudi URL inside snippet__image
-                img_match = re.search(
-                    r'<img[^>]+src="(https://img\.lamudi\.com[^"]+)"',
-                    card,
-                    re.IGNORECASE,
-                )
-                thumbnail = img_match.group(1) if img_match else ""
+            # Image: first <img> with lamudi URL inside snippet__image
+            img_match = re.search(
+                r'<img[^>]+src="(https://img\.lamudi\.com[^"]+)"',
+                card,
+                re.IGNORECASE,
+            )
+            thumbnail = img_match.group(1) if img_match else ""
 
-                logger.info(
-                    "[Lamudi] card: title=%s price=%s loc=%s img=%s",
-                    title[:40], price, item_location[:30], bool(thumbnail),
-                )
+            logger.info(
+                "[Lamudi] card: title=%s price=%s loc=%s img=%s",
+                title[:40], price, item_location[:30], bool(thumbnail),
+            )
 
-                if title and (budget_min <= price <= budget_max or price == 0):
-                    results.append(PropertyListing(
-                        title=title,
-                        price=price,
-                        location=item_location,
-                        property_type=property_type,
-                        source=self.source_name,
-                        url=item_url,
-                        image_url=thumbnail,
-                        images=[thumbnail] if thumbnail else [],
-                    ))
+            if title and (budget_min <= price <= budget_max or price == 0):
+                results.append(PropertyListing(
+                    title=title,
+                    price=price,
+                    location=item_location,
+                    property_type=property_type,
+                    source=self.source_name,
+                    url=item_url,
+                    image_url=thumbnail,
+                    images=[thumbnail] if thumbnail else [],
+                ))
 
-                if len(results) >= limit:
-                    break
-
-        except Exception as e:
-            logger.warning("[Lamudi] search error: %s", e)
+            if len(results) >= limit:
+                break
 
         return results
 
