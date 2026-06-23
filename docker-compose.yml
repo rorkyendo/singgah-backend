@@ -1,0 +1,52 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: singgah_db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${DB_NAME:-singgah_chat}
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: singgah_backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://root:root@db:3306/singgah_chat}
+      PROJECT_NAME: ${PROJECT_NAME:-Singgah SmartAdvisor}
+      API_KEY: ${API_KEY}
+      LLM_MODEL: ${LLM_MODEL:-openai/gpt-3.5-turbo}
+      LLM_URL: ${LLM_URL:-https://openrouter.ai/api/v1}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ../singgahUI
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8000/}
+    container_name: singgah_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  db_data:

@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+.env
+.git
+.gitignore
+*.md
+*.log
+inspect_results.txt
+tmp_*.py
+tmp_*.log
