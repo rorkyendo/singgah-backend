@@ -330,6 +330,69 @@ class FacebookMarketplaceScraper(BaseScraper):
         return results
 
 
+class LamudiScraper(BaseScraper):
+    source_name = "Lamudi"
+
+    async def search(
+        self,
+        client: httpx.AsyncClient,
+        location: str,
+        budget_min: int,
+        budget_max: int,
+        property_type: str = "kost",
+        limit: int = 5,
+    ) -> list[PropertyListing]:
+        results: list[PropertyListing] = []
+        encoded_location = quote(location)
+        encoded_query = quote(f"{property_type} {location}")
+        url = (
+            f"https://www.lamudi.co.id/search/"
+            f"?q={encoded_query}"
+            f"&type=rent"
+            f"&price_min={budget_min}"
+            f"&price_max={budget_max}"
+        )
+
+        try:
+            resp = await client.get(
+                url,
+                headers=self._build_headers(),
+                timeout=self.timeout,
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                return results
+
+            html = resp.text
+            cards = re.findall(
+                r'<a[^>]*href="(/property/[^"]+)"[^>]*>.*?'
+                r'<h[23][^>]*>(.*?)</h[23]>.*?'
+                r'Rp\s*([\d.,]+)',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+
+            for match in cards[:limit]:
+                item_url = f"https://www.lamudi.co.id{match[0]}"
+                title = re.sub(r"<[^>]+>", "", match[1]).strip()
+                price = self._clean_price(match[2])
+
+                if budget_min <= price <= budget_max or price == 0:
+                    results.append(PropertyListing(
+                        title=title or f"{property_type.title()} di {location}",
+                        price=price,
+                        location=location,
+                        property_type=property_type,
+                        source=self.source_name,
+                        url=item_url,
+                    ))
+
+        except Exception:
+            pass
+
+        return results
+
+
 async def run_all_scrapers(
     location: str,
     budget_min: int,
@@ -341,6 +404,7 @@ async def run_all_scrapers(
         OLXScraper(),
         MamikostScraper(),
         PinhomeScraper(),
+        LamudiScraper(),
         FacebookMarketplaceScraper(),
     ]
 
