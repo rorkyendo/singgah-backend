@@ -35,21 +35,37 @@ class HousingAgent:
             FacebookAgent(),
         ]
 
-    def _is_valid_listing(self, listing: PropertyListing, location: str) -> bool:
-        """Filter out junk/non-property listings."""
+    def _is_valid_listing(
+        self,
+        listing: PropertyListing,
+        location: str,
+        budget_min: int = 0,
+        budget_max: int = 0,
+        property_type: str = "kost",
+    ) -> bool:
+        """Filter out junk/non-property listings and enforce budget/tenure/type."""
         title = (listing.title or "").lower().strip()
         if not title or len(title) < 5:
             return False
 
+        if property_type == "kontrakan":
+            # Kontrakan searches should not return kost/kosan/boarding rooms
+            if any(k in title for k in ["kost", "kosan", "kost-kostan", "kost putri", "kost cowok"]):
+                return False
+
         # Property-related keywords any valid title should contain
         property_keywords = [
             "kost", "kos", "kontrakan", "kontrakan", "rumah", "apartemen",
-            "apartment", "sewa", "kamar", "disewakan", "dijual", "cluster",
+            "apartment", "sewa", "kamar", "disewakan", "cluster",
             "perumahan", "ruko", "villa", "mewah", "asri", "nyaman", "strategis",
         ]
         has_property_keyword = any(k in title for k in property_keywords)
 
         is_reliable = listing.source in self.RELIABLE_SOURCES
+
+        # Reject sale listings when we are looking for rentals (kost/kontrakan/apartemen)
+        if "dijual" in title or " for sale" in title or "jual rumah" in title:
+            return False
 
         if not listing.url and not has_property_keyword:
             # Fake LLM-fallback listings usually have no URL and no property keyword
@@ -66,15 +82,73 @@ class HousingAgent:
         if listing.price < 0:
             return False
 
+        # Enforce price range against the requested budget
+        if budget_max > 0 and listing.price > 0:
+            yearly_keywords = ["tahun", "tahunan", "per tahun", "yearly", "tahunan"]
+            is_yearly = any(k in title for k in yearly_keywords)
+            if is_yearly:
+                max_allowed = budget_max * 12
+            else:
+                # Monthly or unknown: allow small tolerance above monthly budget
+                max_allowed = budget_max * 1.5
+            if listing.price > max_allowed:
+                return False
+            if listing.price < budget_min * 0.5:
+                return False
+
         return True
 
-    async def search_listings(
+    async def _expand_location(
+        self,
+        location: str,
+        property_type: str,
+        language: str = "id",
+    ) -> list[str]:
+        """Use LLM to expand broad regions (e.g., Jabodetabek) into specific cities."""
+        prompt = (
+            f"User sedang mencari {property_type} di wilayah '{location}'. "
+            "Jika lokasi tersebut adalah wilayah luas/metropolitan (misal Jabodetabek, Jabotabek, Greater Jakarta), "
+            "kembalikan daftar kota/kabupaten spesifik yang termasuk dalam wilayah tersebut sebagai JSON array string. "
+            f"Jika sudah spesifik, kembalikan [\"{location}\"]. "
+            "Contoh: Jabodetabek -> [\"Jakarta\", \"Bogor\", \"Depok\", \"Tangerang\", \"Bekasi\"]. "
+            "Kembalikan hanya JSON array string, tanpa penjelasan."
+        )
+        if language.lower() == "en":
+            prompt = (
+                f"User is searching for {property_type} in area '{location}'. "
+                "If the location is a broad metropolitan region (e.g., Jabodetabek, Greater Jakarta), "
+                "return a JSON array of specific cities/districts within that region. "
+                f"If already specific, return [\"{location}\"]. "
+                "Example: Jabodetabek -> [\"Jakarta\", \"Bogor\", \"Depok\", \"Tangerang\", \"Bekasi\"]. "
+                "Return only a JSON array of strings, no explanation."
+            )
+        try:
+            response = llm_client.chat.completions.create(
+                model=settings.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": settings.SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=100,
+                stream=False,
+            )
+            text = response.choices[0].message.content.strip()
+            text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            locations = json.loads(text)
+            if isinstance(locations, list) and locations:
+                return [str(loc).strip() for loc in locations if loc]
+        except Exception as e:
+            logger.warning("_expand_location failed: %s", e)
+        return [location]
+
+    async def _search_single_location(
         self,
         location: str,
         budget_min: int,
         budget_max: int,
-        status_pernikahan: str = "lajang",
-        limit_per_source: int = 3,
+        status_pernikahan: str,
+        limit_per_source: int,
     ) -> tuple[list[PropertyListing], dict[str, int]]:
         property_type = "kontrakan" if status_pernikahan == "menikah" else "kost"
 
@@ -87,16 +161,17 @@ class HousingAgent:
             ]
             results_per_source = await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.scraped_listings = []
+        listings: list[PropertyListing] = []
         source_counts: dict[str, int] = {}
         for idx, result in enumerate(results_per_source):
             agent_name = self.service_agents[idx].source_name
             if isinstance(result, list):
-                valid = [l for l in result if self._is_valid_listing(l, location)]
+                valid = [l for l in result if self._is_valid_listing(l, location, budget_min, budget_max, property_type)]
                 source_counts[agent_name] = len(valid)
                 logger.info(
-                    "[%-20s] raw=%d valid=%d",
+                    "[%-20s] loc=%s raw=%d valid=%d",
                     agent_name,
+                    location,
                     len(result),
                     len(valid),
                 )
@@ -110,22 +185,12 @@ class HousingAgent:
                         listing.url,
                         listing.image_url,
                     )
-                self.scraped_listings.extend(valid)
+                listings.extend(valid)
             elif isinstance(result, Exception):
-                logger.warning("[%-20s] error: %s", agent_name, result)
+                logger.warning("[%-20s] loc=%s error: %s", agent_name, location, result)
                 source_counts[agent_name] = 0
 
-        self.source_counts = source_counts
-
-        logger.info(
-            "[TOTAL] %d listings from %d sources for %s in %s",
-            len(self.scraped_listings),
-            len(set(l.source for l in self.scraped_listings)),
-            property_type,
-            location,
-        )
-
-        return self.scraped_listings, source_counts
+        return listings, source_counts
 
     def rank_listings(self, budget_min: int, budget_max: int) -> list[PropertyListing]:
         mid_budget = (budget_min + budget_max) / 2
@@ -241,11 +306,19 @@ class HousingAgent:
 
     def listings_to_products(self, listings: list[PropertyListing]) -> list[dict]:
         products = []
+        yearly_keywords = ["tahun", "tahunan", "per tahun", "yearly", "tahunan"]
         for listing in listings[:10]:
+            title_lower = (listing.title or "").lower()
+            is_yearly = any(k in title_lower for k in yearly_keywords)
+            if is_yearly and listing.price > 1000000:
+                monthly_price = listing.price // 12
+                price_label = f"Rp{monthly_price:,}/bulan (Rp{listing.price:,}/tahun)"
+            else:
+                price_label = f"Rp{listing.price:,}" if listing.price else "Harga nego"
             products.append({
                 "nama_tempat": listing.title,
                 "tipe": listing.property_type or "Kost",
-                "harga": f"Rp{listing.price:,}" if listing.price else "Harga nego",
+                "harga": price_label,
                 "lokasi": listing.location,
                 "sumber": listing.source,
                 "url": listing.url,
@@ -327,13 +400,53 @@ class HousingAgent:
         budget_min = user_info.get("budget_min", 500000)
         budget_max = user_info.get("budget_max", 3000000)
         status = user_info.get("status_pernikahan", "lajang")
+        property_type = "kontrakan" if status == "menikah" else "kost"
 
-        _, source_counts = await self.search_listings(
-            location=location,
-            budget_min=budget_min,
-            budget_max=budget_max,
-            status_pernikahan=status,
-            limit_per_source=limit_per_source,
+        locations = await self._expand_location(location, property_type, language)
+        logger.info("[EXPAND] %s -> %s", location, locations)
+
+        # For broad regions, fetch more results per source to ensure good coverage
+        effective_limit = limit_per_source
+        if len(locations) > 1:
+            effective_limit = max(limit_per_source, 5)
+
+        # Run one search per expanded location in parallel
+        search_tasks = [
+            self._search_single_location(
+                loc, budget_min, budget_max, status, effective_limit,
+            )
+            for loc in locations
+        ]
+        search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+        all_listings: list[PropertyListing] = []
+        source_counts: dict[str, int] = {}
+        for result in search_results:
+            if isinstance(result, Exception):
+                logger.warning("Search location failed: %s", result)
+                continue
+            listings, counts = result
+            all_listings.extend(listings)
+            for source, count in counts.items():
+                source_counts[source] = source_counts.get(source, 0) + count
+
+        # Deduplicate by URL
+        seen_urls = set()
+        deduped: list[PropertyListing] = []
+        for listing in all_listings:
+            if listing.url and listing.url in seen_urls:
+                continue
+            if listing.url:
+                seen_urls.add(listing.url)
+            deduped.append(listing)
+
+        self.scraped_listings = deduped
+
+        logger.info(
+            "[TOTAL] %d listings across %d locations, %d sources",
+            len(self.scraped_listings),
+            len(locations),
+            len(set(l.source for l in self.scraped_listings)),
         )
 
         ranked = self.rank_listings(budget_min, budget_max)
@@ -342,9 +455,17 @@ class HousingAgent:
             details_json = self.format_for_llm(ranked, user_info)
             products = self.listings_to_products(ranked)
             check_result = self.generate_recommendation_text(details_json, language)
+            messages = [line for line in check_result.splitlines() if line.strip()]
+            if len(locations) > 1:
+                location_str = ", ".join(locations)
+                if language.lower() == "en":
+                    summary = f"Searching across {len(locations)} areas: {location_str}. Found {len(products)} properties within your budget."
+                else:
+                    summary = f"Mencari di {len(locations)} wilayah: {location_str}. Ditemukan {len(products)} properti dalam budget Anda."
+                messages.insert(0, summary)
             response = {
                 "rc": "200",
-                "messages": [line for line in check_result.splitlines() if line.strip()],
+                "messages": messages,
                 "is_product": True,
                 "product": products,
                 "source_counts": source_counts,
