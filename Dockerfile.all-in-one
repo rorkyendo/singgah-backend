@@ -1,0 +1,53 @@
+FROM python:3.10-slim
+
+# Install Chromium, ChromeDriver, MariaDB (MySQL-compatible), and runtime libraries.
+# MariaDB is used because MySQL's official packages are not available in Debian apt.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    curl \
+    gnupg \
+    ca-certificates \
+    chromium \
+    chromium-driver \
+    default-mysql-server \
+    libglib2.0-0 \
+    libnss3 \
+    libfontconfig1 \
+    libxss1 \
+    libappindicator3-1 \
+    libgtk-3-0 \
+    libasound2 \
+    libgbm1 \
+    libxslt1.1 \
+    libxml2 \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# Make Chromium discoverable by Selenium with the standard names.
+# Also ensure the chromedriver binary is on the PATH as `chromedriver`.
+RUN ln -s /usr/bin/chromium /usr/bin/google-chrome \
+    && ln -s /usr/bin/chromium /usr/bin/chrome \
+    && (test -f /usr/bin/chromedriver || ln -s /usr/lib/chromium/chromedriver /usr/bin/chromedriver) \
+    && chromedriver --version
+
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_BIN=/usr/bin/chromedriver
+
+# Prepare MariaDB directories.
+RUN mkdir -p /var/lib/mysql /var/run/mysqld \
+    && chown -R mysql:mysql /var/lib/mysql /var/run/mysqld
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+COPY entrypoint-all-in-one.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
