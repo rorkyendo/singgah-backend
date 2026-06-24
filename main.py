@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.routes import chat_route, user_route
+from app.core.config import settings
 from app.db.base import Base
 from app.db.session import engine
 import app.models.saved_property  # noqa: F401 — registers table with Base.metadata
