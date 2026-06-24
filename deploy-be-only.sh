@@ -23,8 +23,13 @@ if [ -z "$DATABASE_URL" ]; then
     echo "LLM_URL=https://openrouter.ai/api/v1"
     echo "CORS_ORIGINS=https://predev.my.id,https://www.predev.my.id"
     echo "PROJECT_NAME=Singgah SmartAdvisor"
+    echo "WA_TOKEN=your_wa_gateway_token"
     echo ""
     exit 1
+fi
+
+if [ -z "$WA_TOKEN" ]; then
+    echo "[WARNING] WA_TOKEN is not set. Fitur notifikasi WhatsApp tidak akan berfungsi."
 fi
 
 if [ -z "$API_KEY" ]; then
@@ -50,6 +55,10 @@ docker run -d \
     -e LLM_URL="${LLM_URL:-https://openrouter.ai/api/v1}" \
     -e CORS_ORIGINS="${CORS_ORIGINS:-*}" \
     -e PROJECT_NAME="${PROJECT_NAME:-Singgah SmartAdvisor}" \
+    -e WA_TOKEN="${WA_TOKEN:-}" \
+    -e WA_GW_URL="${WA_GW_URL:-https://wagw.cvmedandigitalinovasi.com}" \
+    -e WA_SENDER="${WA_SENDER:-6282276648478}" \
+    -e OWNER_NUMBER="${OWNER_NUMBER:-6282276648478}" \
     --restart unless-stopped \
     "${IMAGE_NAME}"
 

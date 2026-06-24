@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     LLM_URL: str
     CORS_ORIGINS: str = "*"
 
+    # WhatsApp gateway configuration.
+    WA_GW_URL: str = "https://wagw.cvmedandigitalinovasi.com"
+    WA_TOKEN: str
+    WA_SENDER: str = "6282276648478"
+    OWNER_NUMBER: str = "6282276648478"
+
     # Legacy prompt fields — kept for backward compat with orchestrator_controller.
     # New code should use prompts.get(lang, key) instead.
     SYSTEM_PROMPT: str = ""

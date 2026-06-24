@@ -1,12 +1,15 @@
 import logging
+
 import httpx
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-WA_GW_URL = "https://wagw.cvmedandigitalinovasi.com"
-WA_TOKEN = "xxjeTURtRoAOHthVorlPPxeOZaifsE"
-WA_SENDER = "6282276648478"
-OWNER_NUMBER = "6282276648478"
+WA_GW_URL = settings.WA_GW_URL
+WA_TOKEN = settings.WA_TOKEN
+WA_SENDER = settings.WA_SENDER
+OWNER_NUMBER = settings.OWNER_NUMBER
 
 
 def _normalize_phone(phone: str) -> str:

@@ -45,6 +45,10 @@ singgah-backend/
 | `LLM_URL` | OpenRouter API URL |
 | `PROJECT_NAME` | App name |
 | `CORS_ORIGINS` | Comma-separated allowed origins (`*` for local dev) |
+| `WA_TOKEN` | WhatsApp gateway API token |
+| `WA_GW_URL` | WhatsApp gateway base URL (optional) |
+| `WA_SENDER` | WhatsApp sender number (optional) |
+| `OWNER_NUMBER` | Owner WhatsApp number for notifications (optional) |
 
 See `.env.example` (local) and `.env.production` (production) for templates.
 
